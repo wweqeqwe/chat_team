@@ -190,6 +190,91 @@ chat-team-boss
 
 需要 `OPENAI_API_KEY`（同主机器人,从 `~/.chat_team/config.yaml` 的 `llm.api_key` 或环境变量读取）。
 
+## 后台管理界面 (`chat-team-admin`)
+
+独立的 HTTPS 后台管理 web 界面,用来**查看服务状态、重启/热重载 chat_team、
+查看服务器磁盘占用、查看日志**。与主 bot 进程完全独立 —— bot 重启不影响管理界面,
+管理界面重启也不影响 bot。生产级部署:TLS 自管 + 账号密码登录 + CSRF + 登录限流 + 审计日志。
+
+**包含的能力:**
+
+- 浏览器打开网页 → 登录页 → 输账号密码进入 dashboard
+- 服务状态卡:运行中/未运行徽章、PID、运行时长、内存占用
+- 磁盘卡:所在分区总/已用/可用 + chat_team 总占用 + 各子目录(logs/workspaces/state)细分
+- 会话列表:`~/.chat_team/workspaces/<sid>` 按占用排序(文件系统视角,top 20)
+- 操作按钮:**热重载**(`systemctl reload` = SIGHUP,不打断 WebSocket)、
+  **重启**(`systemctl restart`)
+- 日志 tail:chat_team 日志(`journalctl -u chat-team` 或 `~/.chat_team/logs/chat_team.log`)、
+  admin 操作日志(`~/.chat_team/logs/admin.log`),每 5 秒自动刷新
+
+### 装机步骤
+
+```bash
+# 1. 在 ~/.chat_team/config.yaml 把 admin.enabled 改成 true (其余字段用默认即可):
+#    admin:
+#      enabled: true
+
+# 2. 生成自签 TLS 证书 (写到 ~/.chat_team/admin/{cert,key}.pem):
+chat-team-admin init-certs
+
+# 3. 创建第一个登录账号 (交互式输密码,长度 >= 8):
+chat-team-admin add-user admin
+
+# 4. 装 systemd unit 并启动:
+cp scripts/chat-team-admin.service /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now chat-team-admin
+
+# 5. 浏览器访问 https://<server-ip>:8443/
+#    自签证书浏览器会有"不安全"警告,点"高级 → 继续访问"即可。
+systemctl status chat-team-admin     # 看运行状态
+journalctl -u chat-team-admin -f     # 看实时日志
+```
+
+### 子命令
+
+```bash
+chat-team-admin serve           # 启动 web server (无参数时默认)
+chat-team-admin init-certs      # 生成自签证书 (--force 覆盖)
+chat-team-admin add-user <name>  # 创建/更新账号 (交互式输密码)
+```
+
+### 鉴权细节
+
+- **账号存储**:`~/.chat_team/admin/users.json`,密码用 `pbkdf2_sha256` (600000 iterations,OWASP 2023 推荐)。
+- **会话**:登录成功后服务器颁发 32 字节随机 session id,内存存储,cookie 走
+  `HttpOnly + Secure + SameSite=Strict`,默认 8 小时空闲超时。
+- **CSRF**:重启/热重载的 POST 接口必须带 `X-CSRF-Token` 头(同源 cookie 里有 csrf token,
+  dashboard 内置 JS 自动塞头)。坏 token → 403。
+- **登录限流**:同一 IP 5 分钟内 5 次失败 → 第 6 次 429(在密码检查之前就拦截,
+  避免 pbkdf2 被暴力打满 CPU)。成功登录清零。
+- **审计日志**:`~/.chat_team/logs/admin.log`,每次 `login_success`/`login_failed`/
+  `login_blocked`/`restart`/`reload`/`logout` 写一行(时间 + 用户 + IP + UA)。
+
+### 生产加固建议
+
+公网部署时,**仅靠账号密码** 是基线,推荐再叠加一层:
+
+- **升级到 Let's Encrypt 证书**(有域名时,消除浏览器自签警告):
+  ```bash
+  certbot certonly --standalone -d admin.yourdomain.com
+  # 在 config.yaml 里改:
+  # admin:
+  #   tls_cert: /etc/letsencrypt/live/admin.yourdomain.com/fullchain.pem
+  #   tls_key:  /etc/letsencrypt/live/admin.yourdomain.com/privkey.pem
+  systemctl reload chat-team-admin   # 或 restart
+  ```
+- **上 nginx 反代做 IP allowlist**(防御纵深,token 泄露也进不来):
+  在 nginx vhost 里 `allow <你的IP>; deny all;` + `proxy_pass https://127.0.0.1:8443`。
+- **云厂商防火墙限白名单源 IP**(简单粗暴但有效)。
+
+### 配置项 (config.yaml 的 `admin:` 块)
+
+完整字段及默认值见 `~/.chat_team/config.yaml` 末尾的注释段。关键项:
+`enabled` (默认 false)、`host` (默认 0.0.0.0)、`port` (默认 8443)、
+`tls_cert`/`tls_key` (空 → `~/.chat_team/admin/{cert,key}.pem`)、
+`session_idle_seconds` (默认 28800=8h)、`login_rate_limit_per_5min` (默认 5)。
+
 ## 看可用工具清单
 
 手写 role YAML 时,`tools:` 字段只能填主进程注册过的工具名。要看一份当前真实可用的清单:
@@ -247,6 +332,7 @@ python scripts/smoke_compaction_persistence.py    # tiktoken 压缩 + session.js
 python scripts/smoke_media_events.py              # AES-256-CBC + enter_chat / disconnected
 python scripts/smoke_llm_debug_log.py             # 调试日志: image base64 脱敏 + 文件落盘 + per-session seq
 python scripts/smoke_solo.py                      # solo 模式: 独立 dispatcher + 共享 notebook + 隔离持久化
+python scripts/smoke_admin.py                    # 后台管理界面: pbkdf2/session/CSRF/限流/审计 + HTTP 流程
 ```
 
 每个 smoke 都把 `CHAT_TEAM_HOME` 指到 `/tmp/...` 并在启动时 `rmtree`,所以反复跑安全。

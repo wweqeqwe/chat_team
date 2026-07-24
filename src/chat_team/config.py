@@ -138,6 +138,35 @@ class McpConfig:
     servers: list[McpServerConfig] = field(default_factory=list)
 
 
+
+@dataclass
+class AdminConfig:
+    """Backend management web UI (``chat-team-admin``).
+
+    A standalone process serving an HTTPS admin panel: view chat_team
+    service status, restart/reload it, inspect server disk usage + the
+    chat_team home footprint, tail logs. Auth is account+password with a
+    login page; sessions live in-memory inside the admin process. The admin
+    process never touches the bot process directly — it shells out to
+    ``systemctl`` for restart/reload and reads the filesystem for the rest.
+
+    See ``chat_team.admin`` for the standalone entry point.
+    """
+    enabled: bool = False
+    host: str = "0.0.0.0"
+    port: int = 8443
+    # Empty → default to ~/.chat_team/admin/{cert,key}.pem (run
+    # ``chat-team-admin init-certs`` once to generate the self-signed pair).
+    tls_cert: str = ""
+    tls_key: str = ""
+    # Session idle timeout (seconds). Default 8h = a workday.
+    session_idle_seconds: float = 28800.0
+    # Per-IP failed-login budget in a sliding 5-minute window. 5 attempts;
+    # the 6th inside the window returns 429.
+    login_rate_limit_per_5min: int = 5
+    # Empty → ~/.chat_team/logs/admin.log
+    audit_log_path: str = ""
+
 @dataclass
 class PrivateChatConfig:
     """Policy for whether the bot replies to single (private) chats.
@@ -214,6 +243,7 @@ class Settings:
     cleanup: CleanupConfig = field(default_factory=CleanupConfig)
     mcp: McpConfig = field(default_factory=McpConfig)
     private_chat: PrivateChatConfig = field(default_factory=PrivateChatConfig)
+    admin: AdminConfig = field(default_factory=AdminConfig)
     team_profile: str = ""
 
 
@@ -413,6 +443,8 @@ def _build_settings_from_raw(raw: dict[str, Any], paths: Paths) -> Settings:
         _coerce(settings.cleanup, raw["cleanup"])
     settings.private_chat = _build_private_chat(raw)
     settings.mcp = _build_mcp(raw)
+    if isinstance(raw.get("admin"), dict):
+        _coerce(settings.admin, raw["admin"])
 
     # Backward compat: no bots in YAML → synthesize from WECOM_* env vars.
     if not settings.bots:
@@ -529,6 +561,13 @@ def reload_settings(settings: Settings) -> ReloadReport:
     if settings.private_chat != fresh.private_chat:
         settings.private_chat = fresh.private_chat
         report.applied.append("private_chat")
+
+    # admin panel — host/port/tls_cert/tls_key/enabled are baked into the
+    # live aiohttp.web listener at admin-process startup; report them as
+    # restart-only so the maintainer knows to restart chat-team-admin.
+    _apply_safe_nested(settings.admin, fresh.admin, "admin",
+                       restart_keys=frozenset({"enabled", "host", "port", "tls_cert", "tls_key"}),
+                       report=report)
 
     # llm: chat sub-config is fully safe (read per turn).
     _apply_safe_nested(settings.llm.chat, fresh.llm.chat, "llm.chat",

@@ -1,0 +1,32 @@
+[Unit]
+Description=chat_team backend admin panel (HTTPS web UI)
+Documentation=file:///root/workspace/chat_team/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/root/workspace/chat_team
+Environment=CHAT_TEAM_HOME=/root/.chat_team
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/root/workspace/chat_team/.venv/bin/python -m chat_team.admin.cli serve
+ExecReload=/bin/kill -HUP $MAINPID
+KillSignal=SIGTERM
+TimeoutStopSec=10
+Restart=always
+RestartSec=5
+
+# The admin panel writes JSON to ~/.chat_team/admin/ and shells out to
+# `systemctl restart/reload chat-team.service`, so it must run as root.
+# Memory backstop: it's a tiny aiohttp process; keep it cheap.
+MemoryHigh=256M
+MemoryMax=512M
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=chat-team-admin
+
+[Install]
+WantedBy=multi-user.target

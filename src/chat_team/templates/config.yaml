@@ -152,3 +152,31 @@ logging:
 #         GITHUB_PERSONAL_ACCESS_TOKEN: "ghp_..."
 #     remote_api:
 #       url: http://localhost:8080/sse
+
+# ---- 后台管理界面 (chat-team-admin) -----------------------------------------
+# 独立进程 (chat-team-admin.service),提供 HTTPS 网页后台:
+# 查看服务状态 / 重启 chat_team / 热重载 / 查看磁盘占用 / 看日志。
+# 与 chat_team 主进程完全独立,互不影响。
+#
+# 启用步骤:
+#   1. 这里取消注释并设 enabled: true
+#   2. 跑一次: chat-team-admin init-certs   # 生成自签证书 (~/.chat_team/admin/cert.pem,key.pem)
+#   3. 跑一次: chat-team-admin add-user <用户名>   # 交互式输密码,创建登录账号
+#   4. 拷 systemd unit: cp scripts/chat-team-admin.service /etc/systemd/system/
+#      systemctl daemon-reload && systemctl enable --now chat-team-admin
+#   5. 浏览器访问 https://<server-ip>:8443/   (自签证书浏览器会警告,信任即可)
+#
+# 升级到 Let's Encrypt 证书 (有域名时):
+#   certbot certonly --standalone -d admin.yourdomain.com
+#   把下方 tls_cert / tls_key 指向 /etc/letsencrypt/live/admin.yourdomain.com/{fullchain,privkey}.pem
+#   systemctl restart chat-team-admin
+#
+# admin:
+#   enabled: true                      # 必须 true 才启动 web server
+#   host: 0.0.0.0                      # 0.0.0.0 = 公网可访问; 127.0.0.1 = 仅本机
+#   port: 8443                         # HTTPS 端口
+#   tls_cert: ""                       # 空 → ~/.chat_team/admin/cert.pem
+#   tls_key: ""                        # 空 → ~/.chat_team/admin/key.pem
+#   session_idle_seconds: 28800        # 登录会话空闲超时 (秒); 28800 = 8 小时
+#   login_rate_limit_per_5min: 5       # 单 IP 5 分钟内允许失败次数,第 6 次 429
+#   audit_log_path: ""                 # 空 → ~/.chat_team/logs/admin.log

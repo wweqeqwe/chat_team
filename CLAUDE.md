@@ -41,12 +41,18 @@ python scripts/smoke_solo.py                      # solo mode: per-bot dispatche
 python scripts/smoke_private_chat_policy.py     # private_chat policy: open/closed/blacklist/whitelist + adapter gate + enter_chat
 python scripts/smoke_key_rotation.py            # llm.api_keys round-robin: (session,role) binding + idle reset + multi-key retry + single-key compat
 python scripts/smoke_slash_commands.py            # /new /stop /status (group+private) + /running (private-only) + history rollback on /stop
+python scripts/smoke_admin.py                    # backend admin panel: pbkdf2/session/CSRF/rate-limit/audit + aiohttp HTTP flow
 
 # Conversational team-setup CLI (not the WeCom bot — see "Boss agent" below).
 chat-team-boss
 
 # Print all tools registered in the main runtime, for hand-authored role YAMLs.
 chat-team-tools          # or: python -m chat_team.list_tools
+
+# Backend admin panel (HTTPS web UI, separate process — see "Admin panel" below).
+chat-team-admin serve            # start the admin web server (default if no subcommand)
+chat-team-admin init-certs       # generate a self-signed TLS cert pair to ~/.chat_team/admin/
+chat-team-admin add-user <name>  # create/update an admin login user (interactive password)
 ```
 
 There is no test framework — smokes are async `main()` scripts that print and assert. Add new smokes alongside the existing ones; they all set `CHAT_TEAM_HOME=/tmp/...` and `shutil.rmtree` it at startup so they don't pollute the real `~/.chat_team`.
@@ -107,6 +113,64 @@ Key isolation points:
 - **`write_role`** validates input (yaml parse → `Role.from_dict` → name match → atomic write) before touching disk; bad YAML returns `ToolError` and the LLM self-corrects on retry.
 - **Confirmation is by-prompt, not by-CLI**: the boss's system prompt requires it to paste the full proposed YAML/markdown to the user and ask "是否确认写入?" before invoking any write tool. There is no separate y/N gate.
 - **No persistence**: each `chat-team-boss` invocation starts a fresh chat. The durable state lives in the role YAMLs and `team.md` it edits.
+
+## Admin panel (`chat-team-admin`, separate process)
+
+`src/chat_team/admin/` is a **standalone** HTTPS web panel (`chat-team-admin`)
+running in its own systemd unit (`scripts/chat-team-admin.service`). It is
+deliberately decoupled from the bot runtime — no shared imports of
+`Dispatcher`/`Agent`/`Adapter`. Status comes from `systemctl`, disk from
+`os.statvfs` + `du`, log tail from `journalctl`/file. The bot and the panel
+can be restarted independently.
+
+Layout:
+- `admin/auth.py` — `UserStore` (pbkdf2_sha256, 600k iters, OWASP 2023; tolerates
+  `None` user with a timing-equal dummy pbkdf2 to mitigate username enumeration),
+  `SessionStore` (in-memory `{sid: {username, expires_at, csrf_token, ip}}`,
+  sliding-window expiry), `LoginRateLimiter` (per-IP sliding 5min, counts
+  *failed* logins only — the right password never trips), `AuditLogger`
+  (append-only line per event to `~/.chat_team/logs/admin.log`).
+- `admin/inspect.py` — framework-agnostic sync helpers wrapped in
+  `asyncio.to_thread` for use from aiohttp routes. `get_service_status_sync`
+  parses `systemctl show` (ActiveState/SubState/MainPID/ActiveEnterTimestamp/
+  MemoryCurrent), falls back to `ps` + `/proc/<pid>` RSS when systemctl is
+  unavailable. `_du_subdir_sync` walks `~/.chat_team/{logs,workspaces,state,...}`
+  via `du -sb` (Python fallback), plus per-session top-N. `CachedDiskInspector`
+  caches the result 30s so refresh-spamming doesn't hammer the disk.
+- `admin/cli.py` — `add-user` (interactive `getpass`, ≥8 chars, mismatch
+  rejected, atomic write to users.json), `init-certs` (RSA-2048 self-signed,
+  1 year, via `cryptography`), `serve` (loads settings + validates cert/users
+  exist + runs `aiohttp.web.run_app(..., ssl_context=...)`).
+- `admin/server.py` — `build_app(settings)` wires aiohttp routes +
+  `require_auth` middleware (HTML routes 302 /login, /api/* → 401). CSRF is
+  double-submit (X-CSRF-Token header == csrf cookie AND == server-side session
+  token, constant-time compared). On_startup spawns a session-sweeper task
+  (every 5min); the callback MUST be async because aiohttp's `aiosignal.send`
+  awaits the receiver's return value — a sync callback returning None raises
+  `TypeError: object NoneType can't be used in 'await' expression`.
+
+Auth flow: `POST /login` (form) → `UserStore.verify` (timing-safe) → on
+success `SessionStore.create` returns `(sid, csrf)` → both set as cookies
+(session: `HttpOnly+Secure+SameSite=Strict`; csrf: `Secure+SameSite=Strict`
+but NOT HttpOnly so the dashboard JS can read it for the X-CSRF-Token header).
+Failed logins recorded in `LoginRateLimiter` AND `AuditLogger`; success clears
+the IP's failure window. `POST /api/{restart,reload}` require a valid session
+AND a matching CSRF header; both shell out to `systemctl` (no PolKit needed
+because the unit runs as root).
+
+Config: `Settings.admin: AdminConfig` (enabled/host/port/tls_cert/tls_key/
+session_idle_seconds/login_rate_limit_per_5min/audit_log_path). All fields are
+marked `requires_restart` in `reload_settings` because they're baked into the
+live aiohttp listener at admin-process startup — `chat-team --reload` (the
+bot's SIGHUP) does NOT pick them up; restart `chat-team-admin` instead.
+
+`build_app` is a pure function so `scripts/smoke_admin.py` exercises the full
+HTTP flow via `aiohttp.test_utils.TestClient` over plain HTTP (TLS skipped in
+tests). Critical smoke-test detail: `TestClient` follows redirects by default,
+so the login POST must use `allow_redirects=False` to read `Set-Cookie` off
+the 302 directly — otherwise the cookie lands in the client's jar instead of
+in `r.cookies`, and every subsequent `headers={"Cookie": ...}` test would
+send literal `"None"` and 500 the request serializer.
 
 ## Non-obvious mechanics
 

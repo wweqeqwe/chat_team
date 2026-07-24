@@ -24,6 +24,7 @@ dependencies = [
 chat-team = "chat_team.app:run"
 chat-team-boss = "chat_team.boss:run"
 chat-team-tools = "chat_team.list_tools:run"
+chat-team-admin = "chat_team.admin.cli:run"
 
 [tool.setuptools.packages.find]
 where = ["src"]

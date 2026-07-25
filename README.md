@@ -46,7 +46,7 @@ On first launch, default configuration is generated under `~/.chat_team/`:
   team.md          # Global team profile; injected into every employee's system prompt each turn if non-empty; requires restart after editing
   roles/           # User-defined role YAMLs; same-name overrides built-ins
   workspaces/      # One subdirectory per session
-  logs/            # chat_team.log, RotatingFileHandler
+  logs/            # chat_team.log + chat_team.out + admin.log, all rotating (see Log rotation in AGENTS.md)
   state/           # Cross-session state reservation
 ```
 
@@ -144,7 +144,7 @@ INFO chat_team.adapters.wecom | connecting to wss://openws.work.weixin.qq.com
 INFO chat_team.adapters.wecom | subscribe ok: {...errcode: 0...}
 ```
 
-You can then @mention the bot or start a private chat in WeCom. Logs are written to both stderr and `~/.chat_team/logs/chat_team.log` (rotating 10MB × 5 files).
+You can then @mention the bot or start a private chat in WeCom. Logs are written to both stderr and `~/.chat_team/logs/chat_team.log` (rotating 10 MB × 5 files); the daemon's stdout/stderr land in `chat_team.out` (rotated in-process by the OutFileRotator copytruncate reaper, default 10 MB × 5); admin audit events go to `admin.log` (rotating 5 MB × 5). All three are bounded — see "Log rotation" in `AGENTS.md`.
 
 ## `chat-team-boss` (Configuration Assistant)
 

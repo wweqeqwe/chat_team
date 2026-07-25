@@ -129,8 +129,22 @@ class LLMVisionConfig:
 
 @dataclass
 class LoggingConfig:
+    # chat_team.log rotation (RotatingFileHandler in configure_logging).
     max_bytes: int = 10 * 1024 * 1024
     backup_count: int = 5
+    # chat_team.out rotation (the daemon's stdout/stderr, dup2'd to a raw FD
+    # so a Python handler can't intercept it). Rotated in-process by an
+    # asyncio copytruncate reaper (OutFileRotator) — it reads the file, shifts
+    # .N → .N+1, writes the current contents into .1, then os.truncate(0)s
+    # the live file. The open O_APPEND FD stays valid; subsequent writes
+    # resume at byte 0. requires_restart because the reaper is started once
+    # at daemon startup with the then-current thresholds.
+    out_max_bytes: int = 10 * 1024 * 1024
+    out_backup_count: int = 5
+    # How often the reaper wakes to stat() the out file. 5 minutes is a
+    # reasonable idle-friendly default; bumping it doesn't change the cap,
+    # only the worst-case overshoot before a rotation triggers.
+    out_check_interval_seconds: float = 300.0
 
 
 @dataclass
@@ -166,6 +180,14 @@ class AdminConfig:
     login_rate_limit_per_5min: int = 5
     # Empty → ~/.chat_team/logs/admin.log
     audit_log_path: str = ""
+    # Rotation for admin.log. The AuditLogger wraps a
+    # logging.handlers.RotatingFileHandler; both knobs are requires_restart
+    # (the handler is constructed once at admin-process startup with the
+    # then-current path + thresholds). Default 5 MB × 5 backups ~= 25 MB
+    # ceiling — admin events are infrequent (one line per login/restart/
+    # reload), so this is generous.
+    audit_log_max_bytes: int = 5 * 1024 * 1024
+    audit_log_backup_count: int = 5
 
 @dataclass
 class PrivateChatConfig:
@@ -566,7 +588,8 @@ def reload_settings(settings: Settings) -> ReloadReport:
     # live aiohttp.web listener at admin-process startup; report them as
     # restart-only so the maintainer knows to restart chat-team-admin.
     _apply_safe_nested(settings.admin, fresh.admin, "admin",
-                       restart_keys=frozenset({"enabled", "host", "port", "tls_cert", "tls_key"}),
+                       restart_keys=frozenset({"enabled", "host", "port", "tls_cert", "tls_key",
+                       "audit_log_path", "audit_log_max_bytes", "audit_log_backup_count"}),
                        report=report)
 
     # llm: chat sub-config is fully safe (read per turn).

@@ -105,7 +105,11 @@ def build_app(settings: Settings) -> web.Application:
     app["users"].ensure_file()
     app["sessions"] = SessionStore(settings.admin.session_idle_seconds)
     app["rate_limiter"] = LoginRateLimiter(settings.admin.login_rate_limit_per_5min)
-    app["audit"] = AuditLogger(_audit_log_path(settings))
+    app["audit"] = AuditLogger(
+        _audit_log_path(settings),
+        max_bytes=settings.admin.audit_log_max_bytes,
+        backup_count=settings.admin.audit_log_backup_count,
+    )
     app["disk"] = CachedDiskInspector(settings.paths.home, cache_ttl=30.0)
 
     # Background sweeper: purge expired sessions every 5 min so the in-memory

@@ -31,6 +31,7 @@ from .agent.tools.shell_tool import RunCommandTool
 from .agent.tools.skill_tools import SkillReadFileTool, SkillTool
 from .agent.tools.transfer_tool import TransferToEmployeeTool
 from .config import Settings, load_settings
+from .out_rotator import OutFileRotator
 from .daemon import daemonize_and_run, reload_daemon, stop_daemon
 from .dispatcher import Dispatcher
 from .llm.base import LLMProvider
@@ -417,12 +418,20 @@ async def _run_solo(
     reloader = Reloader(
         settings, [d for _, d in adapters], reconfigure_logging=configure_logging,
     )
+    out_rotator = OutFileRotator(
+        settings.paths.logs_dir / "chat_team.out",
+        max_bytes=settings.logging.out_max_bytes,
+        backup_count=settings.logging.out_backup_count,
+        check_interval_seconds=settings.logging.out_check_interval_seconds,
+    )
+    out_rotator.start()
     try:
         await _run_with_shutdown(
             asyncio.gather(*[a.run_forever() for a, _ in adapters]),
             on_sighup=reloader.reload,
         )
     finally:
+        await out_rotator.stop()
         for a, _ in adapters:
             await a.close()
         all_sessions: list = []
@@ -470,6 +479,18 @@ async def _async_main(adapter_factory) -> None:
     reloader = Reloader(
         settings, [dispatcher], reconfigure_logging=configure_logging,
     )
+    # Rotate the daemon's stdout/stderr file (chat_team.out) so it can't grow
+    # unbounded. No-op in foreground mode (-f): the file isn't written there,
+    # but the reaper stat()s a non-existent file and exits immediately. In
+    # solo mode the reaper is started below in _run_solo instead so each bot's
+    # lifecycle is self-contained.
+    out_rotator = OutFileRotator(
+        settings.paths.logs_dir / "chat_team.out",
+        max_bytes=settings.logging.out_max_bytes,
+        backup_count=settings.logging.out_backup_count,
+        check_interval_seconds=settings.logging.out_check_interval_seconds,
+    )
+    out_rotator.start()
     try:
         # Prefer run_forever (handles transient WS loss); fall back to the
         # one-shot connect+run for adapters that don't implement it.
@@ -483,6 +504,7 @@ async def _async_main(adapter_factory) -> None:
 
             await _run_with_shutdown(_one_shot(), on_sighup=reloader.reload)
     finally:
+        await out_rotator.stop()
         await adapter.close()
         if dispatcher.persistence is not None:
             await dispatcher.persistence.flush_all(dispatcher.sessions.all_sessions())

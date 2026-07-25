@@ -77,7 +77,7 @@ All persistent state lives under `~/.chat_team/` (override with `CHAT_TEAM_HOME`
       runs/<ts>.log        # full shell stdout (tool returns truncated)
       llm/<ts>-<seq>-<role>-<kind>.json  # per-LLM-call debug record (when llm.debug_log_enabled)
   chat_team.pid            # PID of the background daemon (only in default background mode)
-  logs/                    # rotating chat_team.log + chat_team.out (daemon stdout/stderr)
+  logs/                    # all rotating: chat_team.log + chat_team.out + admin.log (see Log rotation)
   state/                   # cross-session bits (currently empty, reserved)
 ```
 
@@ -129,7 +129,9 @@ Layout:
   `SessionStore` (in-memory `{sid: {username, expires_at, csrf_token, ip}}`,
   sliding-window expiry), `LoginRateLimiter` (per-IP sliding 5min, counts
   *failed* logins only — the right password never trips), `AuditLogger`
-  (append-only line per event to `~/.chat_team/logs/admin.log`).
+  (one line per audit event to `~/.chat_team/logs/admin.log`, rotated via
+  `RotatingFileHandler` with `admin.audit_log_max_bytes` × `admin.audit_log_backup_count`,
+  ~25 MB ceiling).
 - `admin/inspect.py` — framework-agnostic sync helpers wrapped in
   `asyncio.to_thread` for use from aiohttp routes. `get_service_status_sync`
   parses `systemctl show` (ActiveState/SubState/MainPID/ActiveEnterTimestamp/
@@ -221,6 +223,22 @@ send literal `"None"` and 500 the request serializer.
 **Team profile injection.** `~/.chat_team/team.md` is read once by `load_settings` into `settings.team_profile` (stripped); when non-empty, `Agent._build_system_messages` splices it as a `[团队信息]` block alongside the role prompt and meta lines. Empty/missing file → no block, behaviour unchanged. The compactor's `_summarize` uses its own sterile system prompt (`compactor.py:100-107`) and is intentionally NOT touched. Hot-reloadable: `chat-team --reload` (or `kill -HUP <pid>`) re-reads `team.md` into `settings.team_profile` in place; the next turn's system-prompt rebuild picks it up without a restart. See "Hot reload" below.
 
 **LLM debug log.** Opt-in: set `llm.debug_log_enabled: true` in `~/.chat_team/config.yaml` (default off — one file per call piles up fast and transcripts can carry sensitive user content, so production must stay off). When on, every call into `OpenAIChatCompletionProvider.complete` writes a JSON file to `<workspace>/.chat_team/llm/<ts>-<seq>-<role>-<kind>.json`. The record carries the full request payload (messages + tools + model + temperature + max_tokens), the response (content + tool_calls + finish_reason + usage from `completion.usage.model_dump()`), and `latency_ms`. Three `call_kind` values: `agent` (main turn), `compactor` (post-turn summary), `vision` (eager OCR shim + `describe_image` tool). Failures write the same file with `error=repr(exc)` and `response=null` before re-raising. **Base64 image data URIs are redacted** to `[redacted: <mime> <bytes> bytes]` via `chat_team.llm.debug_logger.redact_messages` — files stay grep-able. Per-session monotonic `seq` (process-local dict keyed by `session_id`) keeps filenames sortable when the millisecond clock collides. The provider's `_maybe_write_log` reuses the exact `messages_payload` it built for OpenAI (no re-serialisation), so what you see in the log is what the API saw. Writes are best-effort: a write failure is logged at WARNING and the call still returns normally.
+
+**Log rotation (all log files are bounded).** Three logs live under ``~/.chat_team/logs/``, all rotated so the directory can't grow without bound:
+
+  - ``chat_team.log`` (app log via Python logging) — ``RotatingFileHandler`` with ``logging.max_bytes`` (default 10 MB) × ``logging.backup_count`` (default 5); ~60 MB ceiling. Hot-reloadable.
+  - ``chat_team.out`` (daemon stdout/stderr captured via ``os.open + dup2`` in ``chat_team.daemon.daemonize_and_run``) — a Python handler can't intercept an OS-level FD, so an in-process asyncio **copytruncate reaper** (``chat_team.out_rotator.OutFileRotator``, started in ``_async_main`` / ``_run_solo``) ``stat()``s the file every ``logging.out_check_interval_seconds`` (default 300 s) and, when the size crosses ``logging.out_max_bytes`` (default 10 MB), shifts ``.N → .N+1`` (oldest deleted), ``shutil.copy2``s the live file into ``.1``, then ``os.truncate(0)``s the live file. The open ``O_APPEND`` FD stays valid — every ``write(2)`` seeks to the current EOF before writing, so after truncation the daemon's next stdout/stderr write resumes at byte 0 of the same inode (no FD re-open, no lost writes). ``requires_restart`` because the reaper task is created at daemon startup with the then-current thresholds.
+  - ``admin.log`` (admin panel audit log) — ``AuditLogger`` wraps a ``RotatingFileHandler`` with ``admin.audit_log_max_bytes`` (default 5 MB) × ``admin.audit_log_backup_count`` (default 5); ~25 MB ceiling. ``requires_restart`` (handler constructed once at admin-process startup).
+
+Defaults bound the three log files to ~145 MB combined (``chat_team.log`` ~60 MB + ``chat_team.out`` ~60 MB + ``admin.log`` ~25 MB). Session workspace files (``inbox/``, ``.chat_team/runs/``, ``.chat_team/llm/``) are bounded separately by the janitor (``cleanup.max_age_days`` = 14, see ``SessionManager._maybe_sweep``). Setting any ``max_bytes``/``backup_count`` to ``0`` disables rotation for that file (not recommended). Smoke: ``scripts/smoke_out_rotator.py`` covers the copytruncate reaper's FD-preservation property; ``scripts/smoke_admin.py`` covers the audit log rotation.
+
+**Log rotation (all log files are bounded).** Three logs live under ``~/.chat_team/logs/``, all rotated so the directory can't grow without bound:
+
+  - ``chat_team.log`` (app log via Python logging) — ``RotatingFileHandler`` with ``logging.max_bytes`` (default 10 MB) × ``logging.backup_count`` (default 5); ~60 MB ceiling. Hot-reloadable.
+  - ``chat_team.out`` (daemon stdout/stderr captured via ``os.open + dup2`` in ``chat_team.daemon.daemonize_and_run``) — a Python handler can't intercept an OS-level FD, so an in-process asyncio **copytruncate reaper** (``chat_team.out_rotator.OutFileRotator``, started in ``_async_main`` / ``_run_solo``) ``stat()``s the file every ``logging.out_check_interval_seconds`` (default 300 s) and, when the size crosses ``logging.out_max_bytes`` (default 10 MB), shifts ``.N → .N+1`` (oldest deleted), ``shutil.copy2``s the live file into ``.1``, then ``os.truncate(0)``s the live file. The open ``O_APPEND`` FD stays valid — every ``write(2)`` seeks to the current EOF before writing, so after truncation the daemon's next stdout/stderr write resumes at byte 0 of the same inode (no FD re-open, no lost writes). ``requires_restart`` because the reaper task is created at daemon startup with the then-current thresholds.
+  - ``admin.log`` (admin panel audit log) — ``AuditLogger`` wraps a ``RotatingFileHandler`` with ``admin.audit_log_max_bytes`` (default 5 MB) × ``admin.audit_log_backup_count`` (default 5); ~25 MB ceiling. ``requires_restart`` (handler constructed once at admin-process startup).
+
+Defaults bound the three log files to ~145 MB combined (``chat_team.log`` ~60 MB + ``chat_team.out`` ~60 MB + ``admin.log`` ~25 MB). Session workspace files (``inbox/``, ``.chat_team/runs/``, ``.chat_team/llm/``) are bounded separately by the janitor (``cleanup.max_age_days`` = 14, see ``SessionManager._maybe_sweep``). Setting any ``max_bytes``/``backup_count`` to ``0`` disables rotation for that file (not recommended). Smoke: ``scripts/smoke_out_rotator.py`` covers the copytruncate reaper's FD-preservation property; ``scripts/smoke_admin.py`` covers the audit log rotation.
 
 ## Slash commands (chat-side, 企业微信端)
 

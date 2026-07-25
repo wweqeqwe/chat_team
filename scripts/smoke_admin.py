@@ -162,6 +162,54 @@ def test_auth() -> None:
             check("audit log has timestamps", content.count("[") >= 2 and content.count("]") >= 2)
             check("audit log single-line per event", content.count("\n") == 2)
 
+        # Audit log rotation — bounded, no infinite growth. Force rotation by
+        # writing events until the RotatingFileHandler crosses max_bytes; the
+        # first backup (.1) must appear and the live file must shrink back
+        # under the cap.
+        with tempfile.TemporaryDirectory() as ad:
+            log_path = Path(ad) / "audit.log"
+            al = AuditLogger(log_path, max_bytes=512, backup_count=3)
+            # Each line is ~70 bytes (ts + 4 fields); ~8 lines = ~560 bytes
+            # which crosses 512. RotatingFileHandler rolls over when the
+            # NEXT write would exceed maxBytes, so we need one more event
+            # past the boundary to actually trigger the rename.
+            for i in range(20):
+                al.log("test_event", user="alice", ip="1.2.3.4",
+                       ua="Mozilla/5.0", extra=f"seq={i}")
+            # After enough writes there must be at least one backup; the
+            # oldest backup holds the earliest events (across multiple
+            # rotations the original content rolls from .1 → .2 → .3 etc.,
+            # so we look for the *highest-numbered* backup file).
+            backups = sorted(name for name in os.listdir(ad)
+                             if name.startswith("audit.log."))
+            check("audit log rotated → ≥1 backup exists", len(backups) >= 1,
+                  f"backups={backups}")
+            check("audit log live file shrunk under cap",
+                  log_path.stat().st_size <= 512,
+                  f"size={log_path.stat().st_size}")
+            # Oldest backup (highest suffix) holds the earliest events.
+            oldest = Path(ad) / backups[-1]
+            oldest_text = oldest.read_text()
+            check("audit log oldest backup has early event",
+                  "seq=0" in oldest_text, f"oldest={oldest.name}")
+            # Live file has the most recent events (post-rotation writes).
+            live_text = log_path.read_text()
+            check("audit log live has latest event", "seq=19" in live_text)
+            # Force more rotations to verify backup chain stays bounded.
+            for i in range(40):
+                al.log("test_event", user="bob", ip="5.6.7.8",
+                       extra=f"seq2={i}")
+            files = sorted(ad_path.name for ad_path in
+                            [Path(ad) / n for n in os.listdir(ad)])
+            # backupCount=3 → at most .1, .2, .3 plus the live file.
+            backup_files = [n for n in os.listdir(ad) if n.startswith("audit.log.")]
+            check("audit log backups bounded (≤ backup_count)",
+                  len(backup_files) <= 3)
+            # No backup should exceed the cap.
+            for name in backup_files:
+                sz = (Path(ad) / name).stat().st_size
+                check(f"audit log backup {name} ≤ cap", sz <= 1024)
+
 
 # --------------------------------------------------------------------------
 # inspect.py

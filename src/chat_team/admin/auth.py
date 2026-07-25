@@ -24,6 +24,7 @@ import hashlib
 import hmac
 import json
 import logging
+import logging.handlers
 import os
 import secrets
 import threading
@@ -305,13 +306,67 @@ class AuditLogger:
 
         [2025-07-24T12:34:56Z] event=login_success user=alice ip=1.2.3.4 ua=Mozilla/5.0
 
-    Writes are append-only with line buffering; failures log a WARNING and
-    the call returns normally (the panel must keep working even if the audit
-    log is on a read-only mount).
+    Backed by a :class:`logging.handlers.RotatingFileHandler` so the file
+    can't grow without bound. The handler is constructed once per
+    ``AuditLogger`` instance (i.e. once per admin-process start) with
+    ``max_bytes``/``backup_count`` from :class:`Settings.admin`. Writes are
+    best-effort: a write failure logs a WARNING and the call returns
+    normally — the panel must keep working even if the audit log is on a
+    read-only mount. The underlying handler is thread-safe (it's a stdlib
+    logging handler), so concurrent audit calls from different aiohttp
+    routes are safe.
+
+    The :class:`RotatingFileHandler` swaps ``admin.log`` →
+    ``admin.log.1`` → ... → ``admin.log.<backup_count>`` in-place when the
+    file crosses ``max_bytes``. The previous append-only behaviour is
+    preserved for the in-process caller (``log()`` accepts the same kwargs
+    and writes one line per call), but the file on disk is now bounded.
     """
 
-    def __init__(self, log_path: Path):
+    def __init__(
+        self,
+        log_path: Path,
+        *,
+        max_bytes: int = 5 * 1024 * 1024,
+        backup_count: int = 5,
+    ) -> None:
         self.path = log_path
+        # A private logger + handler so audit lines don't bleed into the
+        # root logger (which would double-write them to chat_team.log via
+        # configure_logging's StreamHandler). The logger name is unique
+        # enough to avoid accidental collisions; `propagate=False` is the
+        # real guarantee.
+        self._logger = logging.getLogger(f"chat_team.audit.{log_path.name}")
+        self._logger.propagate = False
+        self._logger.setLevel(logging.INFO)
+        # Strip any handlers from a previous instance (e.g. test re-init on
+        # the same path) so we don't accumulate duplicates.
+        for h in list(self._logger.handlers):
+            try:
+                h.close()
+            except Exception:  # noqa: BLE001
+                pass
+            self._logger.removeHandler(h)
+        try:
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            handler = logging.handlers.RotatingFileHandler(
+                log_path,
+                maxBytes=max(1, int(max_bytes)),
+                backupCount=max(0, int(backup_count)),
+                encoding="utf-8",
+            )
+            handler.setFormatter(logging.Formatter("%(message)s"))
+            self._logger.addHandler(handler)
+            self._handler = handler
+        except OSError as e:
+            # Disk full / read-only mount / permission denied — fall back to
+            # the previous best-effort semantics: keep the path for
+            # tail_log in the panel, but writes will WARN-and-drop.
+            log.warning(
+                "audit log handler init failed for %s (%r); audit events "
+                "will be dropped", log_path, e,
+            )
+            self._handler = None
 
     def log(self, event: str, *, user: str = "", ip: str = "", ua: str = "", extra: str = "") -> None:
         ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -325,10 +380,13 @@ class AuditLogger:
             parts.append(f"ua={' '.join(ua.split()[:6])}")
         if extra:
             parts.append(extra)
-        line = f"[{ts}] {' '.join(parts)}\n"
+        line = f"[{ts}] {' '.join(parts)}"
+        if self._handler is None:
+            log.warning("audit log write skipped (handler init failed); event=%s lost", event)
+            return
         try:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            with open(self.path, "a", encoding="utf-8") as f:
-                f.write(line)
-        except OSError as e:
+            # RotatingFileHandler emits with a trailing newline via the
+            # %(message)s formatter, so we don't append "\n" ourselves.
+            self._logger.info(line)
+        except Exception as e:  # noqa: BLE001
             log.warning("audit log write failed (%r); event=%s lost", e, event)

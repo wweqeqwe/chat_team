@@ -8,6 +8,7 @@ Uses mocks — no real MCP servers needed.
 from __future__ import annotations
 
 import asyncio
+import types
 import os
 import shutil
 import sys
@@ -78,13 +79,21 @@ class FakeCallToolResult:
 
 
 class FakeMcpSession:
-    def __init__(self, result: FakeCallToolResult | None = None, error: Exception | None = None):
+    def __init__(
+        self,
+        result: FakeCallToolResult | None = None,
+        error: Exception | None = None,
+        delay: float = 0.0,
+    ):
         self._result = result or FakeCallToolResult(content=[FakeTextContent(text="sunny, 25C")])
         self._error = error
+        self._delay = delay
         self.calls: list[tuple[str, dict | None]] = []
 
     async def call_tool(self, name: str, arguments: dict | None = None, **kwargs) -> FakeCallToolResult:
         self.calls.append((name, arguments))
+        if self._delay > 0:
+            await asyncio.sleep(self._delay)
         if self._error:
             raise self._error
         return self._result
@@ -299,6 +308,99 @@ async def test_proxy_tool_image_content():
     print("  proxy tool image content: OK")
 
 
+class _FakeMcpSettings:
+    """Minimal stand-in for Settings.mcp so proxy_tool can read the timeout
+    without spinning up the full load_settings() machinery."""
+
+    def __init__(self, tool_timeout_seconds: float):
+        self.mcp = types.SimpleNamespace(tool_timeout_seconds=tool_timeout_seconds)
+
+
+class _FakeSettings:
+    def __init__(self, tool_timeout_seconds: float):
+        self.mcp = types.SimpleNamespace(tool_timeout_seconds=tool_timeout_seconds)
+
+
+async def test_proxy_tool_timeout_triggers_toolerror():
+    """A slow MCP call exceeding the timeout raises ToolError, not hang."""
+    session = FakeMcpSession(delay=5.0)
+    proxy = McpProxyTool("weather", FakeMcpTool(), session)
+    # 0.2s timeout — well under the 5s the fake call will sleep.
+    ctx = ToolContext(
+        cwd=Path("/tmp"), session=None,
+        settings=_FakeSettings(tool_timeout_seconds=0.2),  # type: ignore[arg-type]
+    )
+    try:
+        await proxy.run(ctx, city="Beijing")
+        assert False, "should have raised ToolError on timeout"
+    except ToolError as e:
+        assert "timed out" in str(e).lower()
+        assert "0.2s" in str(e)
+    print("  proxy tool timeout → ToolError: OK")
+
+
+async def test_proxy_tool_timeout_zero_disables():
+    """tool_timeout_seconds=0 means no timeout — slow call completes."""
+    session = FakeMcpSession(delay=0.1)
+    proxy = McpProxyTool("weather", FakeMcpTool(), session)
+    ctx = ToolContext(
+        cwd=Path("/tmp"), session=None,
+        settings=_FakeSettings(tool_timeout_seconds=0),  # type: ignore[arg-type]
+    )
+    result = await proxy.run(ctx, city="Beijing")
+    assert result == "sunny, 25C"
+    print("  proxy tool timeout=0 (disabled): OK")
+
+
+async def test_proxy_tool_timeout_settings_none_uses_default():
+    """When ctx.settings is None (test contexts), the default timeout applies
+    but a fast call still succeeds — verifying the fallback path doesn't
+    break normal calls."""
+    session = FakeMcpSession()
+    proxy = McpProxyTool("weather", FakeMcpTool(), session)
+    ctx = ToolContext(cwd=Path("/tmp"), session=None, settings=None)  # type: ignore[arg-type]
+    result = await proxy.run(ctx, city="Beijing")
+    assert result == "sunny, 25C"
+    print("  proxy tool settings=None fallback: OK")
+
+
+def test_config_tool_timeout_parsing():
+    """mcp.tool_timeout_seconds is read from config.yaml."""
+    home = Path("/tmp/chat_team_mcp_smoke")
+    shutil.rmtree(home, ignore_errors=True)
+    home.mkdir(parents=True)
+    os.environ.setdefault("OPENAI_API_KEY", "test")
+    (home / "config.yaml").write_text("""\
+mcp:
+  tool_timeout_seconds: 30
+  servers:
+    fs:
+      command: /bin/true
+""")
+    settings = load_settings()
+    assert settings.mcp.tool_timeout_seconds == 30.0, \
+        f"expected 30.0, got {settings.mcp.tool_timeout_seconds}"
+    print("  config tool_timeout_seconds parsing: OK")
+
+
+def test_config_tool_timeout_default():
+    """Absent tool_timeout_seconds falls back to 60.0."""
+    home = Path("/tmp/chat_team_mcp_smoke")
+    shutil.rmtree(home, ignore_errors=True)
+    home.mkdir(parents=True)
+    os.environ.setdefault("OPENAI_API_KEY", "test")
+    (home / "config.yaml").write_text("""\
+mcp:
+  servers:
+    fs:
+      command: /bin/true
+""")
+    settings = load_settings()
+    assert settings.mcp.tool_timeout_seconds == 60.0, \
+        f"expected 60.0 default, got {settings.mcp.tool_timeout_seconds}"
+    print("  config tool_timeout_seconds default: OK")
+
+
 def test_registry_names():
     """ToolRegistry.names() returns all registered tool names."""
     reg = ToolRegistry()
@@ -449,6 +551,11 @@ async def main() -> None:
     await test_proxy_tool_error_wrapping()
     await test_proxy_tool_is_error_flag()
     await test_proxy_tool_image_content()
+    await test_proxy_tool_timeout_triggers_toolerror()
+    await test_proxy_tool_timeout_zero_disables()
+    await test_proxy_tool_timeout_settings_none_uses_default()
+    test_config_tool_timeout_parsing()
+    test_config_tool_timeout_default()
     test_registry_names()
     test_effective_tool_names()
     test_effective_tool_names_no_mcp()

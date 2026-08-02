@@ -6,6 +6,14 @@ from dataclasses import dataclass, field
 
 _NAME_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
 
+# Default per-call timeout for MCP tool invocations. MCP servers that hang
+# (e.g. an upstream vision API returning 504 after 60-90s) would otherwise
+# block the agent's tool loop indefinitely, freezing the WeCom stream at
+# "正在处理,请稍候...". This ceiling turns a hung MCP call into a ToolError
+# the LLM can recover from. Override in config.yaml via
+# ``mcp.tool_timeout_seconds``. Set to 0 to disable the timeout entirely.
+DEFAULT_TOOL_TIMEOUT_SECONDS = 60.0
+
 
 @dataclass
 class McpServerConfig:

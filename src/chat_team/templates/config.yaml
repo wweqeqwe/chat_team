@@ -141,6 +141,10 @@ logging:
 #   3. 重启 bot — 启动日志会显示发现了多少工具
 #
 # mcp:
+#   # 每个 MCP 工具调用的超时上限 (秒)。0 = 不限时 (旧行为,不推荐)。
+#   # 当 MCP 服务器内部卡住 (如上游视觉 API 持续 504) 时,这个上限会把挂起的
+#   # 调用转成 ToolError,让 LLM 改走备用工具,而不是让 WeCom 流卡在"正在处理"。
+#   tool_timeout_seconds: 60
 #   servers:
 #     filesystem:
 #       command: npx

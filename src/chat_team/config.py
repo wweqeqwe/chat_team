@@ -150,6 +150,11 @@ class LoggingConfig:
 @dataclass
 class McpConfig:
     servers: list[McpServerConfig] = field(default_factory=list)
+    # Per-call timeout (seconds) applied to every MCP tool invocation via
+    # McpProxyTool.run. 0 disables the timeout (legacy behaviour). Hot-reload
+    # reports this as requires_restart because the whole ``mcp`` top-level
+    # block is structural; restart to change it.
+    tool_timeout_seconds: float = 60.0
 
 
 
@@ -398,7 +403,16 @@ def _build_mcp(raw: dict[str, Any]) -> McpConfig:
             mcp_servers.append(cfg)
         except ValueError:
             _log.warning("skipping invalid mcp server %r", srv_name, exc_info=True)
-    return McpConfig(servers=mcp_servers)
+    tool_timeout_raw = raw.get("mcp", {}).get("tool_timeout_seconds", 60.0)
+    try:
+        tool_timeout = float(tool_timeout_raw)
+    except (TypeError, ValueError):
+        _log.warning(
+            "mcp.tool_timeout_seconds must be a number, got %r; falling back to 60.0",
+            tool_timeout_raw,
+        )
+        tool_timeout = 60.0
+    return McpConfig(servers=mcp_servers, tool_timeout_seconds=tool_timeout)
 
 
 def _build_private_chat(raw: dict[str, Any]) -> PrivateChatConfig:

@@ -6,6 +6,7 @@ optionally pushes status notes via the supplied StreamHandle.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from dataclasses import dataclass, field
@@ -40,6 +41,10 @@ log = logging.getLogger(__name__)
 # to execute Python emitted by skill bodies — community skills can't be modified
 # to declare deps, so we teach the agent a uniform `uv run` + PEP 723 pattern
 # that resolves third-party imports without polluting the host environment.
+# Sentinel used by _run_tools_parallel to defer a TransferRequested re-raise
+# until after all parallel results have been appended to history.
+_TRANSFER_RAISE_SENTINEL: Any = object()
+
 PYTHON_UV_CONVENTION = """[Python 执行约定]
 当你需要执行 Python 脚本且引入第三方库时,请使用 PEP 723 inline metadata + `uv run`,不要直接 `pip install` 也不要假设库已安装:
 
@@ -194,55 +199,36 @@ class Agent:
                 if not assistant.tool_calls:
                     return assistant.content or ""
 
-                # Run each tool call serially. Surface errors back to the LLM.
+                # Dispatch tool calls. When every call in this batch targets a
+                # ``parallel_safe`` tool (e.g. all MCP proxy tools), run them
+                # concurrently via ``asyncio.gather`` to collapse N network
+                # round-trips into one. If any call targets a non-parallel-safe
+                # tool (write_file / run_command / transfer_to_employee / …),
+                # fall back to the original serial loop to preserve ordering,
+                # side-effect isolation, and TransferRequested short-circuit
+                # semantics. Mixed batches are run serially — simpler and safe.
+                if assistant.tool_calls and all(
+                    self._is_parallel_safe(c.name) for c in assistant.tool_calls
+                ):
+                    ret = await self._run_tools_parallel(
+                        assistant.tool_calls, stream,
+                        repeated_error_counts, REPEATED_ERROR_BREAK_THRESHOLD,
+                    )
+                    if ret is not None:
+                        # Circuit breaker tripped — return the fallback reply.
+                        return ret
+                    # All tools completed; continue the outer loop so the LLM
+                    # gets the tool results and can produce the final answer
+                    # (or issue another batch of tool_calls).
+                    continue
                 for call in assistant.tool_calls:
-                    await stream.status(f"调用工具: {call.name}")
-                    try:
-                        result = await self._invoke_tool(call, stream)
-                    except TransferRequested as transfer:
-                        # Close the dangling tool_call in our own history so
-                        # this role's transcript stays well-formed if it's
-                        # revisited. Don't roll back — the closed sequence is
-                        # valid OpenAI history that the dispatcher relies on.
-                        self.history.append(ChatMessage(
-                            role="tool",
-                            content=f"[transferred] target={transfer.target}",
-                            tool_call_id=call.id,
-                            name=call.name,
-                        ))
-                        raise                              # propagate to dispatcher
-                    except ToolError as err:
-                        result = f"[tool_error] {err}"
-                        # Circuit breaker: track repeated identical errors.
-                        args_sig = json.dumps(call.arguments or {}, sort_keys=True, ensure_ascii=False)
-                        key = (call.name, args_sig)
-                        repeated_error_counts[key] = repeated_error_counts.get(key, 0) + 1
-                        if repeated_error_counts[key] >= REPEATED_ERROR_BREAK_THRESHOLD:
-                            log.warning(
-                                "agent %s: tool %s raised ToolError %d times with identical args; "
-                                "breaking tool loop to avoid infinite retry",
-                                self.role.name, call.name,
-                                repeated_error_counts[key],
-                            )
-                            self.history.append(ChatMessage(
-                                role="tool",
-                                content=stringify_result(result),
-                                tool_call_id=call.id,
-                                name=call.name,
-                            ))
-                            return (
-                                "我尝试了多次执行该操作但均被系统策略拒绝,可能是因为缺少必要的关键词。"
-                                "如需生成报告,请回复『报告』或『出报告』等关键词,我会立即为您处理。"
-                            )
-                    except Exception as err:               # noqa: BLE001
-                        log.exception("tool %s raised", call.name)
-                        result = f"[tool_error] {type(err).__name__}: {err}"
-                    self.history.append(ChatMessage(
-                        role="tool",
-                        content=stringify_result(result),
-                        tool_call_id=call.id,
-                        name=call.name,
-                    ))
+                    ret = await self._run_one_tool_serial(
+                        call, stream,
+                        repeated_error_counts, REPEATED_ERROR_BREAK_THRESHOLD,
+                    )
+                    if ret is not None:
+                        # Circuit breaker tripped — return the fallback reply.
+                        return ret
 
             # safety fuse — too many loops without a final answer
             return "(已达到工具循环上限,本轮未给出最终答复)"
@@ -260,6 +246,170 @@ class Agent:
             # the dispatcher's busy-state cleanup in its finally block.
             del self.history[pre_turn_len:]
             raise
+
+    def _is_parallel_safe(self, name: str) -> bool:
+        """Return True iff the named tool opts into concurrent dispatch."""
+        if not self.tools.has(name):
+            return False
+        return getattr(self.tools.get(name), "parallel_safe", False)
+
+    async def _run_one_tool_serial(
+        self,
+        call: ToolCall,
+        stream: StreamHandle,
+        repeated_error_counts: dict[tuple[str, str], int],
+        threshold: int,
+    ) -> str | None:
+        """Run a single tool call serially, append its result to history.
+
+        Returns ``None`` on success (the result was appended to history). On
+        circuit-breaker trip returns a fallback reply string that the caller
+        should return to the user. Re-raises ``TransferRequested`` to
+        propagate to the dispatcher.
+        """
+        await stream.status(f"调用工具: {call.name}")
+        try:
+            result = await self._invoke_tool(call, stream)
+        except TransferRequested as transfer:
+            # Close the dangling tool_call in our own history so this role's
+            # transcript stays well-formed if it's revisited. Don't roll
+            # back — the closed sequence is valid OpenAI history the
+            # dispatcher relies on.
+            self.history.append(ChatMessage(
+                role="tool",
+                content=f"[transferred] target={transfer.target}",
+                tool_call_id=call.id,
+                name=call.name,
+            ))
+            raise                              # propagate to dispatcher
+        except ToolError as err:
+            result = f"[tool_error] {err}"
+            if self._maybe_break_circuit(
+                call, result, repeated_error_counts, threshold,
+            ):
+                return (
+                    "我尝试了多次执行该操作但均被系统策略拒绝,可能是因为缺少必要的关键词。"
+                    "如需生成报告,请回复『报告』或『出报告』等关键词,我会立即为您处理。"
+                )
+        except Exception as err:               # noqa: BLE001
+            log.exception("tool %s raised", call.name)
+            result = f"[tool_error] {type(err).__name__}: {err}"
+        self.history.append(ChatMessage(
+            role="tool",
+            content=stringify_result(result),
+            tool_call_id=call.id,
+            name=call.name,
+        ))
+        return None
+
+    async def _run_tools_parallel(
+        self,
+        calls: list[ToolCall],
+        stream: StreamHandle,
+        repeated_error_counts: dict[tuple[str, str], int],
+        threshold: int,
+    ) -> str | None:
+        """Run a batch of parallel-safe tool calls concurrently.
+
+        All calls in ``calls`` must target ``parallel_safe`` tools. Results
+        are collected via ``asyncio.gather(..., return_exceptions=True)`` so
+        one failure does not cancel the others, then appended to history in
+        the original ``tool_calls`` order (required by the OpenAI API: tool
+        messages must match the order of the assistant's tool_calls).
+
+        ``TransferRequested`` should never be raised by a parallel-safe tool
+        (only ``transfer_to_employee`` raises it, and that tool is not
+        parallel-safe), but we handle it defensively: if any call raises it,
+        we still append results for all calls before re-raising.
+        """
+        names = ", ".join(c.name for c in calls)
+        await stream.status(f"调用工具: {names}")
+
+        async def _one(call: ToolCall) -> Any:
+            return await self._invoke_tool(call, stream)
+
+        raw_results = await asyncio.gather(
+            *(_one(c) for c in calls), return_exceptions=True,
+        )
+
+        # Append results in the original order. If a circuit-breaker trip is
+        # detected, finish appending the remaining results first (so history
+        # stays well-formed) then return the fallback reply.
+        fallback_reply: str | None = None
+        for call, res in zip(calls, raw_results):
+            if isinstance(res, TransferRequested):
+                self.history.append(ChatMessage(
+                    role="tool",
+                    content=f"[transferred] target={res.target}",
+                    tool_call_id=call.id,
+                    name=call.name,
+                ))
+                # Re-raise after appending all results — but gather already
+                # completed, so we can raise now. However we still need to
+                # append any later results to keep history consistent, so
+                # defer the raise.
+                if fallback_reply is None:
+                    fallback_reply = _TRANSFER_RAISE_SENTINEL
+                continue
+            if isinstance(res, ToolError):
+                result = f"[tool_error] {res}"
+                if self._maybe_break_circuit(
+                    call, result, repeated_error_counts, threshold,
+                ):
+                    if fallback_reply is None:
+                        fallback_reply = (
+                            "我尝试了多次执行该操作但均被系统策略拒绝,可能是因为缺少必要的关键词。"
+                            "如需生成报告,请回复『报告』或『出报告』等关键词,我会立即为您处理。"
+                        )
+                    # History already appended by _maybe_break_circuit.
+                    continue
+            elif isinstance(res, BaseException):  # noqa: BLE001
+                log.exception("tool %s raised", call.name)
+                result = f"[tool_error] {type(res).__name__}: {res}"
+            else:
+                result = res
+            self.history.append(ChatMessage(
+                role="tool",
+                content=stringify_result(result),
+                tool_call_id=call.id,
+                name=call.name,
+            ))
+
+        if fallback_reply is _TRANSFER_RAISE_SENTINEL:
+            raise next(
+                r for r in raw_results if isinstance(r, TransferRequested)
+            )
+        return fallback_reply
+
+    def _maybe_break_circuit(
+        self,
+        call: ToolCall,
+        result: str,
+        repeated_error_counts: dict[tuple[str, str], int],
+        threshold: int,
+    ) -> bool:
+        """Track repeated identical ToolErrors; return True to break the loop."""
+        args_sig = json.dumps(
+            call.arguments or {}, sort_keys=True, ensure_ascii=False,
+        )
+        key = (call.name, args_sig)
+        repeated_error_counts[key] = repeated_error_counts.get(key, 0) + 1
+        if repeated_error_counts[key] >= threshold:
+            log.warning(
+                "agent %s: tool %s raised ToolError %d times with identical args; "
+                "breaking tool loop to avoid infinite retry",
+                self.role.name, call.name,
+                repeated_error_counts[key],
+            )
+            # Append the failing result so history stays well-formed.
+            self.history.append(ChatMessage(
+                role="tool",
+                content=stringify_result(result),
+                tool_call_id=call.id,
+                name=call.name,
+            ))
+            return True
+        return False
 
     async def _invoke_tool(self, call: ToolCall, stream: StreamHandle) -> Any:
         if not self.tools.has(call.name):

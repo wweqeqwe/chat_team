@@ -16,7 +16,13 @@ class McpProxyTool(Tool):
 
     Registered as ``mcp__<server>__<tool>`` so role YAMLs (via
     ``mcp_servers:``) or explicit ``tools:`` entries can reference it.
+
+    ``parallel_safe=True`` because MCP tool state lives in the remote server
+    and the MCP client multiplexes concurrent ``call_tool`` requests by ID
+    without a global lock. The agent can dispatch a batch of MCP tool_calls
+    concurrently via ``asyncio.gather``.
     """
+    parallel_safe: bool = True
 
     def __init__(self, server_name: str, mcp_tool: Any, session: Any) -> None:
         self.name = f"mcp__{server_name}__{mcp_tool.name}"

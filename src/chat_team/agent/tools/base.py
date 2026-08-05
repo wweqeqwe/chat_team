@@ -57,6 +57,18 @@ class Tool(abc.ABC):
     name: str = ""
     description: str = ""
     parameters: dict[str, Any] = {}
+    # ``parallel_safe=True`` marks a tool as safe to invoke concurrently with
+    # other parallel-safe tools within the same agent turn (when the LLM emits
+    # multiple tool_calls in one assistant message). The agent dispatches such
+    # batches via ``asyncio.gather`` instead of the default serial loop.
+    #
+    # A tool is parallel-safe when it is read-only, side-effect-free, and does
+    # not mutate shared session state (cwd files, notebook, agent.history).
+    # MCP proxy tools qualify by default: their state lives in the remote
+    # server and the MCP client multiplexes requests by ID without a global
+    # lock. Local tools that write files or run shell commands must stay
+    # ``parallel_safe=False`` (the default) to avoid races.
+    parallel_safe: bool = False
 
     def spec(self) -> ToolSpec:
         return ToolSpec(name=self.name, description=self.description, parameters=self.parameters)

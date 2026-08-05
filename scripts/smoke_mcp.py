@@ -267,6 +267,43 @@ async def test_proxy_tool_run():
     print("  proxy tool run: OK")
 
 
+async def test_proxy_tool_resolves_workspace_image_aliases():
+    """Workspace-style image paths are resolved before an MCP call."""
+    workspace = Path("/tmp/chat_team_mcp_smoke/workspace")
+    image = workspace / "inbox" / "photo.jpg"
+    image.parent.mkdir(parents=True, exist_ok=True)
+    image.write_bytes(b"fake jpeg")
+
+    session = FakeMcpSession()
+    proxy = McpProxyTool(
+        "agnes",
+        FakeMcpTool(name="agnes_image_recognition"),
+        session,
+    )
+    ctx = ToolContext(
+        cwd=workspace,
+        session=None,
+        settings=None,
+    )  # type: ignore[arg-type]
+
+    for supplied_path in [
+        "/workspace/inbox/photo.jpg",
+        "/mnt/data/inbox/photo.jpg",
+        "./inbox/photo.jpg",
+        "inbox/photo.jpg",
+    ]:
+        await proxy.run(ctx, image=supplied_path, prompt="describe")
+
+    expected = str(image.resolve())
+    assert session.calls == [
+        (
+            "agnes_image_recognition",
+            {"image": expected, "prompt": "describe"},
+        )
+    ] * 4
+    print("  proxy tool workspace image aliases: OK")
+
+
 async def test_proxy_tool_error_wrapping():
     """MCP call_tool exception → ToolError."""
     session = FakeMcpSession(error=ConnectionError("server down"))
@@ -548,6 +585,7 @@ async def main() -> None:
     test_config_no_mcp_section()
     test_proxy_tool_construction()
     await test_proxy_tool_run()
+    await test_proxy_tool_resolves_workspace_image_aliases()
     await test_proxy_tool_error_wrapping()
     await test_proxy_tool_is_error_flag()
     await test_proxy_tool_image_content()

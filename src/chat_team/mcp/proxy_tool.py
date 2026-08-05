@@ -3,12 +3,43 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from pathlib import Path
 from typing import Any
 
 from ..agent.tools.base import Tool, ToolContext, ToolError
 from .config import DEFAULT_TOOL_TIMEOUT_SECONDS
 
 log = logging.getLogger(__name__)
+
+
+def _resolve_workspace_image_path(cwd: Path, supplied: str) -> str:
+    """Resolve common LLM workspace aliases to an existing sandboxed file."""
+    direct = Path(supplied)
+    if direct.is_absolute() and direct.is_file():
+        return str(direct.resolve())
+
+    relative: str | None = None
+    for prefix in ("/workspace/", "/mnt/data/"):
+        if supplied.startswith(prefix):
+            relative = supplied.removeprefix(prefix)
+            break
+    else:
+        if supplied.startswith("./"):
+            relative = supplied.removeprefix("./")
+        elif not direct.is_absolute():
+            relative = supplied
+
+    if not relative:
+        return supplied
+
+    workspace = cwd.resolve()
+    candidate = (workspace / relative).resolve()
+    try:
+        candidate.relative_to(workspace)
+    except ValueError:
+        return supplied
+
+    return str(candidate) if candidate.is_file() else supplied
 
 
 class McpProxyTool(Tool):
@@ -49,14 +80,27 @@ class McpProxyTool(Tool):
 
     async def run(self, ctx: ToolContext, **kwargs: Any) -> str:
         timeout = self._resolve_timeout(ctx)
+        arguments = dict(kwargs)
+        image = arguments.get("image")
+        if isinstance(image, str):
+            resolved_image = _resolve_workspace_image_path(ctx.cwd, image)
+            if resolved_image != image:
+                log.debug(
+                    "resolved MCP image path for %s: %s -> %s",
+                    self.name,
+                    image,
+                    resolved_image,
+                )
+                arguments["image"] = resolved_image
+
         try:
             if timeout > 0:
                 result = await asyncio.wait_for(
-                    self._session.call_tool(self._remote_name, kwargs or None),
+                    self._session.call_tool(self._remote_name, arguments or None),
                     timeout=timeout,
                 )
             else:
-                result = await self._session.call_tool(self._remote_name, kwargs or None)
+                result = await self._session.call_tool(self._remote_name, arguments or None)
         except asyncio.TimeoutError as exc:
             # A hung MCP server (e.g. upstream API stuck returning 504 after
             # 60-90s) would otherwise freeze the agent's tool loop and the

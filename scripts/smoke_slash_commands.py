@@ -1,4 +1,4 @@
-"""Offline smoke test for slash commands: /new /stop /status /running.
+"""Offline smoke test for slash commands and their Chinese aliases.
 
 These commands live in ``WeComBotAdapter._handle_msg_callback`` (intercepted
 before inbound queueing) and call into Dispatcher's command-support surface
@@ -184,8 +184,12 @@ async def test_match_slash_command():
     assert adapter._match_slash_command(mk("single", "/new"), "text") == "new"
     assert adapter._match_slash_command(mk("single", "/STOP"), "text") == "stop"
     assert adapter._match_slash_command(mk("single", "/status now"), "text") == "status"
+    assert adapter._match_slash_command(mk("single", "/刷新"), "text") == "new"
+    assert adapter._match_slash_command(mk("single", "/停止"), "text") == "stop"
+    assert adapter._match_slash_command(mk("single", "/状态 现在"), "text") == "status"
     # Word boundary: /newton is NOT /new.
     assert adapter._match_slash_command(mk("single", "/newton ideas"), "text") is None
+    assert adapter._match_slash_command(mk("single", "/刷新一下"), "text") is None
     # Non-text msgtype is never a command.
     assert adapter._match_slash_command(mk("single", "/new"), "image") is None
 
@@ -193,10 +197,13 @@ async def test_match_slash_command():
     assert adapter._match_slash_command(mk("group", "/new", chatid="G1"), "text") is None
     # Group chat with @bot works.
     assert adapter._match_slash_command(mk("group", "@BOT /new", chatid="G1"), "text") == "new"
+    assert adapter._match_slash_command(mk("group", "@BOT /刷新", chatid="G1"), "text") == "new"
+    assert adapter._match_slash_command(mk("group", "@小管 /停止", chatid="G1"), "text") == "stop"
+    assert adapter._match_slash_command(mk("group", "@小管 /状态", chatid="G1"), "text") == "status"
     assert adapter._match_slash_command(mk("group", "@小管 /running", chatid="G1"), "text") == "running"
     # @bot followed by ordinary text is not a command.
     assert adapter._match_slash_command(mk("group", "@BOT hello", chatid="G1"), "text") is None
-    print("  ✓ _match_slash_command: private bare, group @bot, word-boundary, non-text")
+    print("  ✓ _match_slash_command: English + Chinese, private bare, group @bot, boundaries")
 
 
 async def test_status_idle_and_busy():
@@ -237,7 +244,7 @@ async def test_status_idle_and_busy():
 
     # /status while idle.
     sent.clear()
-    frame_status2 = text_frame("stat2", "/status", userid="U1")
+    frame_status2 = text_frame("stat2", "/状态", userid="U1")
     await adapter._handle_msg_callback(frame_status2)
     s2 = reply_text(sent)
     assert s2 and "空闲" in s2, f"got {s2!r}"
@@ -268,9 +275,9 @@ async def test_new_resets_history_keeps_role_and_workspace():
     marker.write_text("kept", encoding="utf-8")
     assert marker.exists()
 
-    # /new
+    # /刷新 (alias of /new)
     sent.clear()
-    frame_new = text_frame("new1", "/new", userid="U1")
+    frame_new = text_frame("new1", "/刷新", userid="U1")
     await adapter._handle_msg_callback(frame_new)
     r = reply_text(sent)
     assert r and "已重置" in r and "team_admin" in r, f"got {r!r}"
@@ -331,9 +338,9 @@ async def test_stop_cancels_running_turn_and_drains_queue():
     await asyncio.sleep(0.05)
     assert dispatcher.is_busy(sid)
 
-    # /stop via @bot in the group.
+    # /停止 (alias of /stop) via @bot in the group.
     sent.clear()
-    frame_stop = text_frame("s1", "@BOT /stop", chattype="group", chatid="G1")
+    frame_stop = text_frame("s1", "@BOT /停止", chattype="group", chatid="G1")
     await adapter._handle_msg_callback(frame_stop)
     r = reply_text(sent)
     assert r and "已中止" in r, f"got {r!r}"

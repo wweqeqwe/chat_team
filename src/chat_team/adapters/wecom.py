@@ -69,9 +69,18 @@ MEDIA_SIZE_LIMITS = {
 _MENTION_RE = re.compile(r"^@\S+\s+")
 
 # Slash command matching. Anchored at start, requires a word boundary after
-# the command name so "/newton" does NOT match "/new". Case-insensitive.
-# Group 1 captures the bare command name (lower-cased by the caller).
-_SLASH_CMD_RE = re.compile(r"^/(new|stop|status|running)\b", re.IGNORECASE)
+# the command name so "/newton" does NOT match "/new". English names are
+# case-insensitive; Chinese aliases are normalised to their canonical names.
+# Group 1 captures the bare command name.
+_SLASH_CMD_RE = re.compile(
+    r"^/(new|stop|status|running|刷新|停止|状态)\b",
+    re.IGNORECASE,
+)
+_SLASH_CMD_ALIASES = {
+    "刷新": "new",
+    "停止": "stop",
+    "状态": "status",
+}
 # Commands that operate on the current session (group OR private).
 _SESSION_SLASH_CMDS = {"new", "stop", "status"}
 # /running is private-chat only (it inspects OTHER sessions' busy state).
@@ -1073,8 +1082,8 @@ class WeComBotAdapter(BotAdapter):
         inbound: IncomingMessage,
         msgtype: str,
     ) -> str | None:
-        """Return the lower-cased command name if this inbound text message
-        is a recognised slash command, else None.
+        """Return the canonical command name if this inbound text message is
+        a recognised slash command, else None.
 
         Rules:
           * Only ``msgtype == "text"`` is considered. Images/mixed/voice/etc
@@ -1089,7 +1098,9 @@ class WeComBotAdapter(BotAdapter):
             member mentioning "/new" mid-sentence from resetting the session.
           * In SINGLE (private) chats no @bot is required — the
             private_chat gate already controls who can reach this point.
-          * Case-insensitive.
+          * English command names are case-insensitive. Chinese aliases
+            ``/刷新``, ``/停止``, and ``/状态`` map to ``new``, ``stop``,
+            and ``status`` respectively.
         """
         if msgtype != "text":
             return None
@@ -1116,7 +1127,8 @@ class WeComBotAdapter(BotAdapter):
         m = _SLASH_CMD_RE.match(text)
         if m is None:
             return None
-        return m.group(1).lower()
+        matched = m.group(1).lower()
+        return _SLASH_CMD_ALIASES.get(matched, matched)
 
     async def _reply_slash(self, req_id: Any, text: str) -> None:
         """Reply to a slash command with a single finished stream frame.

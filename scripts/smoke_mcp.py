@@ -347,15 +347,29 @@ async def test_proxy_tool_image_content():
 
 class _FakeMcpSettings:
     """Minimal stand-in for Settings.mcp so proxy_tool can read the timeout
-    without spinning up the full load_settings() machinery."""
+    and result-size cap without spinning up the full load_settings() machinery."""
 
-    def __init__(self, tool_timeout_seconds: float):
-        self.mcp = types.SimpleNamespace(tool_timeout_seconds=tool_timeout_seconds)
+    def __init__(
+        self,
+        tool_timeout_seconds: float,
+        tool_result_max_bytes: int = 8192,
+    ):
+        self.mcp = types.SimpleNamespace(
+            tool_timeout_seconds=tool_timeout_seconds,
+            tool_result_max_bytes=tool_result_max_bytes,
+        )
 
 
 class _FakeSettings:
-    def __init__(self, tool_timeout_seconds: float):
-        self.mcp = types.SimpleNamespace(tool_timeout_seconds=tool_timeout_seconds)
+    def __init__(
+        self,
+        tool_timeout_seconds: float,
+        tool_result_max_bytes: int = 8192,
+    ):
+        self.mcp = types.SimpleNamespace(
+            tool_timeout_seconds=tool_timeout_seconds,
+            tool_result_max_bytes=tool_result_max_bytes,
+        )
 
 
 async def test_proxy_tool_timeout_triggers_toolerror():
@@ -399,6 +413,153 @@ async def test_proxy_tool_timeout_settings_none_uses_default():
     result = await proxy.run(ctx, city="Beijing")
     assert result == "sunny, 25C"
     print("  proxy tool settings=None fallback: OK")
+
+
+async def test_proxy_tool_result_truncated_when_over_cap():
+    """A result larger than ``mcp.tool_result_max_bytes`` is byte-truncated
+    and a ``[truncated: ...]`` notice carrying original/kept/dropped byte
+    counts is appended. Reproduces the smartsheet_get_records(1000 rows)
+    blow-up that inflated a 462k-token LLM request in production."""
+    big_payload = "X" * 100_000                       # 100 KB ASCII
+    session = FakeMcpSession(FakeCallToolResult(
+        content=[FakeTextContent(text=big_payload)],
+    ))
+    proxy = McpProxyTool("weather", FakeMcpTool(), session)
+    ctx = ToolContext(
+        cwd=Path("/tmp"), session=None,
+        settings=_FakeSettings(tool_timeout_seconds=60, tool_result_max_bytes=8192),
+        # type: ignore[arg-type]
+    )
+    result = await proxy.run(ctx, city="Beijing")
+
+    # Body capped at 8192 bytes; notice appended with the byte accounting.
+    assert result.endswith(
+        "[truncated: original 100000 bytes, kept 8192 bytes, dropped 91808 bytes]"
+    ), f"notice missing/wrong: ...{result[-120:]}"
+    body = result.removesuffix(
+        "\n[truncated: original 100000 bytes, kept 8192 bytes, dropped 91808 bytes]"
+    )
+    assert len(body.encode("utf-8")) == 8192, (
+        f"body should be exactly 8192 bytes, got {len(body.encode('utf-8'))}"
+    )
+    print("  proxy tool result truncated + notice appended: OK")
+
+
+async def test_proxy_tool_result_truncation_disabled_when_zero():
+    """``tool_result_max_bytes=0`` disables truncation — the full payload
+    passes through untouched (legacy behaviour; not recommended)."""
+    big_payload = "Y" * 5_000
+    session = FakeMcpSession(FakeCallToolResult(
+        content=[FakeTextContent(text=big_payload)],
+    ))
+    proxy = McpProxyTool("weather", FakeMcpTool(), session)
+    ctx = ToolContext(
+        cwd=Path("/tmp"), session=None,
+        settings=_FakeSettings(tool_timeout_seconds=60, tool_result_max_bytes=0),
+        # type: ignore[arg-type]
+    )
+    result = await proxy.run(ctx, city="Beijing")
+    assert result == big_payload, "max_bytes=0 must not truncate"
+    assert "[truncated:" not in result
+    print("  proxy tool result max_bytes=0 (disabled): OK")
+
+
+async def test_proxy_tool_result_truncation_settings_none_uses_default():
+    """When ctx.settings is None, the default cap (8192) still applies —
+    a 100 KB payload is truncated even without settings wired up."""
+    big_payload = "Z" * 100_000
+    session = FakeMcpSession(FakeCallToolResult(
+        content=[FakeTextContent(text=big_payload)],
+    ))
+    proxy = McpProxyTool("weather", FakeMcpTool(), session)
+    ctx = ToolContext(cwd=Path("/tmp"), session=None, settings=None)  # type: ignore[arg-type]
+    result = await proxy.run(ctx, city="Beijing")
+    assert "[truncated:" in result, "default cap should still truncate 100KB"
+    assert "original 100000 bytes" in result
+    assert "kept 8192 bytes" in result
+    print("  proxy tool result settings=None uses default 8192: OK")
+
+
+async def test_proxy_tool_result_truncation_multibyte_utf8_safe():
+    """Truncation cuts on the byte boundary but decodes with errors=ignore,
+    so a multi-byte UTF-8 char is dropped whole rather than emitting a
+    replacement char / broken bytes."""
+    # 1000 中 = 3000 UTF-8 bytes; cap at 7 bytes (2 chars + 1 dangling byte).
+    payload = "中" * 1000
+    session = FakeMcpSession(FakeCallToolResult(
+        content=[FakeTextContent(text=payload)],
+    ))
+    proxy = McpProxyTool("weather", FakeMcpTool(), session)
+    ctx = ToolContext(
+        cwd=Path("/tmp"), session=None,
+        settings=_FakeSettings(tool_timeout_seconds=60, tool_result_max_bytes=7),
+        # type: ignore[arg-type]
+    )
+    result = await proxy.run(ctx, city="Beijing")
+    assert result.startswith("中中"), (
+        f"first 2 chars should survive the 7-byte cut, got: {result[:20]!r}"
+    )
+    assert "[truncated:" in result
+    assert "original 3000 bytes" in result
+    assert "kept 7 bytes" in result
+    # No U+FFFD replacement char should leak through (errors="ignore").
+    assert "\ufffd" not in result
+    print("  proxy tool result multibyte UTF-8 safe truncation: OK")
+
+
+async def test_proxy_tool_small_result_not_truncated():
+    """A result under the cap passes through verbatim — no notice appended."""
+    session = FakeMcpSession(FakeCallToolResult(
+        content=[FakeTextContent(text="short result")],
+    ))
+    proxy = McpProxyTool("weather", FakeMcpTool(), session)
+    ctx = ToolContext(
+        cwd=Path("/tmp"), session=None,
+        settings=_FakeSettings(tool_timeout_seconds=60, tool_result_max_bytes=8192),
+        # type: ignore[arg-type]
+    )
+    result = await proxy.run(ctx, city="Beijing")
+    assert result == "short result"
+    assert "[truncated:" not in result
+    print("  proxy tool small result not truncated: OK")
+
+
+def test_config_tool_result_max_bytes_parsing():
+    """mcp.tool_result_max_bytes is read from config.yaml."""
+    home = Path("/tmp/chat_team_mcp_smoke")
+    shutil.rmtree(home, ignore_errors=True)
+    home.mkdir(parents=True)
+    os.environ.setdefault("OPENAI_API_KEY", "test")
+    (home / "config.yaml").write_text("""\
+mcp:
+  tool_timeout_seconds: 30
+  tool_result_max_bytes: 4096
+  servers:
+    fs:
+      command: /bin/true
+""")
+    settings = load_settings()
+    assert settings.mcp.tool_result_max_bytes == 4096, \
+        f"expected 4096, got {settings.mcp.tool_result_max_bytes}"
+    print("  config tool_result_max_bytes parsing: OK")
+
+
+def test_config_tool_result_max_bytes_default():
+    """Absent tool_result_max_bytes falls back to 8192."""
+    home = Path("/tmp/chat_team_mcp_smoke")
+    shutil.rmtree(home, ignore_errors=True)
+    home.mkdir(parents=True)
+    os.environ.setdefault("OPENAI_API_KEY", "test")
+    (home / "config.yaml").write_text("""\
+mcp:
+  servers:
+    fs:
+      command: /bin/true
+""")
+    settings = load_settings()
+    assert settings.mcp.tool_result_max_bytes == 8192, \
+        f"expected 8192 default, got {settings.mcp.tool_result_max_bytes}"
+    print("  config tool_result_max_bytes default: OK")
 
 
 def test_config_tool_timeout_parsing():
@@ -592,6 +753,13 @@ async def main() -> None:
     await test_proxy_tool_timeout_triggers_toolerror()
     await test_proxy_tool_timeout_zero_disables()
     await test_proxy_tool_timeout_settings_none_uses_default()
+    await test_proxy_tool_result_truncated_when_over_cap()
+    await test_proxy_tool_result_truncation_disabled_when_zero()
+    await test_proxy_tool_result_truncation_settings_none_uses_default()
+    await test_proxy_tool_result_truncation_multibyte_utf8_safe()
+    await test_proxy_tool_small_result_not_truncated()
+    test_config_tool_result_max_bytes_parsing()
+    test_config_tool_result_max_bytes_default()
     test_config_tool_timeout_parsing()
     test_config_tool_timeout_default()
     test_registry_names()

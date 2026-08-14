@@ -145,6 +145,13 @@ logging:
 #   # 当 MCP 服务器内部卡住 (如上游视觉 API 持续 504) 时,这个上限会把挂起的
 #   # 调用转成 ToolError,让 LLM 改走备用工具,而不是让 WeCom 流卡在"正在处理"。
 #   tool_timeout_seconds: 60
+#   # 每个 MCP 工具返回结果的字节上限。超出会被截断并在末尾追加
+#   # "[truncated: original N bytes, kept N bytes, dropped N bytes]" 提示,
+#   # 让 LLM 知道数据被裁剪了 (可改用 filter_spec + 小 limit 重新查询)。
+#   # 0 = 不截断 (不推荐:MCP 服务器可能一次返回数 MB,如 1000 行智能表格,
+#   # 一旦进入 agent.history 就会撑大之后每一次 LLM 请求,且在只有 1 个
+#   # user 消息的会话里无法被 compactor 压缩)。默认值与 tools.shell_output_max_bytes 对齐。
+#   tool_result_max_bytes: 8192
 #   servers:
 #     filesystem:
 #       command: npx

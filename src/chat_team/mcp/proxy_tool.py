@@ -9,6 +9,8 @@ from typing import Any
 from ..agent.tools.base import Tool, ToolContext, ToolError
 from .config import DEFAULT_TOOL_TIMEOUT_SECONDS
 
+DEFAULT_TOOL_RESULT_MAX_BYTES = 8192
+
 log = logging.getLogger(__name__)
 
 
@@ -40,6 +42,34 @@ def _resolve_workspace_image_path(cwd: Path, supplied: str) -> str:
         return supplied
 
     return str(candidate) if candidate.is_file() else supplied
+
+
+def _truncate_result(text: str, max_bytes: int) -> str:
+    """Truncate ``text`` to at most ``max_bytes`` of UTF-8, appending a
+    notice when truncation happened.
+
+    The notice carries original/kept/dropped byte counts so the LLM can
+    see *how much* data was elided and react (e.g. re-query with a
+    ``filter_spec`` + smaller ``limit`` instead of dumping the whole
+    sheet again). Mirrors ``shell_tool._truncate`` semantics: encode →
+    slice on the byte boundary → decode with errors="ignore" so we never
+    split a multi-byte UTF-8 char mid-codepoint.
+
+    ``max_bytes <= 0`` disables truncation (returns ``text`` unchanged).
+    """
+    if max_bytes <= 0:
+        return text
+    encoded = text.encode("utf-8", errors="replace")
+    total = len(encoded)
+    if total <= max_bytes:
+        return text
+    kept = encoded[:max_bytes].decode("utf-8", errors="ignore")
+    dropped = total - max_bytes
+    notice = (
+        f"\n[truncated: original {total} bytes, "
+        f"kept {max_bytes} bytes, dropped {dropped} bytes]"
+    )
+    return kept + notice
 
 
 class McpProxyTool(Tool):
@@ -77,6 +107,22 @@ class McpProxyTool(Tool):
             return float(settings.mcp.tool_timeout_seconds)
         except (AttributeError, TypeError, ValueError):
             return DEFAULT_TOOL_TIMEOUT_SECONDS
+
+    def _resolve_max_bytes(self, ctx: ToolContext) -> int:
+        """Resolve the per-call result size cap, in bytes. 0 disables it.
+
+        Reads ``settings.mcp.tool_result_max_bytes`` when available; falls
+        back to DEFAULT_TOOL_RESULT_MAX_BYTES (8192) in test contexts
+        where ``ctx.settings`` is None or the field is missing (older
+        fakes that only set ``tool_timeout_seconds``).
+        """
+        settings = getattr(ctx, "settings", None)
+        if settings is None:
+            return DEFAULT_TOOL_RESULT_MAX_BYTES
+        try:
+            return int(settings.mcp.tool_result_max_bytes)
+        except (AttributeError, TypeError, ValueError):
+            return DEFAULT_TOOL_RESULT_MAX_BYTES
 
     async def run(self, ctx: ToolContext, **kwargs: Any) -> str:
         timeout = self._resolve_timeout(ctx)
@@ -124,4 +170,10 @@ class McpProxyTool(Tool):
                 parts.append(f"[image: {item.mimeType}]")
             else:
                 parts.append(str(item))
-        return "\n".join(parts) or "(no output)"
+        text = "\n".join(parts) or "(no output)"
+        # Cap the size before it lands in agent.history — an MCP server
+        # can return megabytes in one shot (e.g. a 1000-row smartsheet
+        # dump), and once it's in history it inflates *every* subsequent
+        # LLM request and can't be compacted when the session has <=1
+        # user turn. See compactor._find_keep_boundary for the dead-end.
+        return _truncate_result(text, self._resolve_max_bytes(ctx))

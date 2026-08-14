@@ -155,6 +155,15 @@ class McpConfig:
     # reports this as requires_restart because the whole ``mcp`` top-level
     # block is structural; restart to change it.
     tool_timeout_seconds: float = 60.0
+    # Per-call result size cap, in bytes. Tool output larger than this is
+    # truncated to the cap and a ``[truncated: ...]`` notice is appended so
+    # the LLM knows data was elided (it can re-query with a smaller scope,
+    # e.g. smartsheet_get_records with filter_spec + a small ``limit``).
+    # 0 disables truncation (NOT recommended — an MCP server can return
+    # megabytes in one shot, e.g. a 1000-row smartsheet dump, which then
+    # lives in agent.history forever and inflates every subsequent LLM
+    # request). Default matches ``tools.shell_output_max_bytes``.
+    tool_result_max_bytes: int = 8192
 
 
 
@@ -412,7 +421,26 @@ def _build_mcp(raw: dict[str, Any]) -> McpConfig:
             tool_timeout_raw,
         )
         tool_timeout = 60.0
-    return McpConfig(servers=mcp_servers, tool_timeout_seconds=tool_timeout)
+    # Per-call result size cap (bytes). 0 disables truncation. Invalid /
+    # negative values fall back to the McpConfig default (8192) rather than
+    # silently accepting nonsense that would disable the cap.
+    result_max_raw = raw.get("mcp", {}).get("tool_result_max_bytes", 8192)
+    try:
+        result_max = int(result_max_raw)
+        if result_max < 0:
+            raise ValueError("must be >= 0")
+    except (TypeError, ValueError):
+        _log.warning(
+            "mcp.tool_result_max_bytes must be a non-negative integer, got %r; "
+            "falling back to 8192",
+            result_max_raw,
+        )
+        result_max = 8192
+    return McpConfig(
+        servers=mcp_servers,
+        tool_timeout_seconds=tool_timeout,
+        tool_result_max_bytes=result_max,
+    )
 
 
 def _build_private_chat(raw: dict[str, Any]) -> PrivateChatConfig:

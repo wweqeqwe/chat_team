@@ -450,6 +450,14 @@ class OpenAIChatCompletionProvider(LLMProvider):
             "messages": messages_payload,
             "temperature": request.temperature,
         }
+        if request.session_uuid:
+            # ``extra_headers`` is per API call, unlike AsyncOpenAI's
+            # ``default_headers``. This keeps one stable conversation UUID
+            # on every agent/tool/vision/compactor request without leaking
+            # the internal WeCom-derived session_id.
+            kwargs["extra_headers"] = {
+                "x-session-id": request.session_uuid,
+            }
         if request.tools:
             kwargs["tools"] = _to_openai_tools(request.tools)
         if request.max_tokens:

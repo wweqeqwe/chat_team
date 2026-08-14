@@ -5,6 +5,7 @@ Schema::
 
     {
       "session_id": "<sanitized>",
+      "session_uuid": "<stable UUID sent as x-session-id>",
       "current_role": "team_admin",
       "histories": {
         "team_admin": [{"role": "user", "content": "...", ...}, ...]
@@ -90,6 +91,7 @@ def snapshot(session: "Session") -> dict[str, Any]:
     }
     return {
         "session_id": session.session_id,
+        "session_uuid": session.session_uuid,
         "current_role": session.current_role,
         "histories": histories,
     }

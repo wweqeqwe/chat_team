@@ -57,6 +57,7 @@ async def _describe_one(
     image_base_dir: str,
     cache: ImageDescriptionCache,
     session_id: str | None = None,
+    session_uuid: str | None = None,
     role_name: str | None = None,
     debug_log_dir: Path | None = None,
 ) -> str:
@@ -81,6 +82,7 @@ async def _describe_one(
         image_detail=detail,
         image_base_dir=image_base_dir,
         session_id=session_id,
+        session_uuid=session_uuid,
         role_name=role_name,
         call_kind="vision",
         debug_log_dir=debug_log_dir,
@@ -109,6 +111,7 @@ async def describe_images(
     cache: ImageDescriptionCache | None = None,
     max_concurrency: int = DEFAULT_DESCRIBE_CONCURRENCY,
     session_id: str | None = None,
+    session_uuid: str | None = None,
     role_name: str | None = None,
     debug_log_dir: Path | None = None,
 ) -> list[str]:
@@ -137,6 +140,7 @@ async def describe_images(
                 image_base_dir=image_base_dir,
                 cache=cache,
                 session_id=session_id,
+                session_uuid=session_uuid,
                 role_name=role_name,
                 debug_log_dir=debug_log_dir,
             )
@@ -217,6 +221,7 @@ class DescribeImageTool(Tool):
             image_base_dir=str(ctx.cwd),
             max_concurrency=min(DEFAULT_DESCRIBE_CONCURRENCY, len(abs_paths)),
             session_id=ctx.session.session_id,
+            session_uuid=getattr(ctx.session, "session_uuid", None),
             role_name=ctx.session.current_role,
             debug_log_dir=ctx.cwd / ".chat_team" / "llm",
         )

@@ -185,6 +185,7 @@ class Agent:
                     image_detail=self._image_detail(),
                     image_base_dir=self.session.cwd,
                     session_id=self.session.session_id,
+                    session_uuid=self.session.session_uuid,
                     role_name=self.role.name,
                     call_kind="agent",
                     debug_log_dir=self.session.cwd / ".chat_team" / "llm",

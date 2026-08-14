@@ -7,6 +7,7 @@ turn processing, and a pending handoff note (consumed on the next turn).
 from __future__ import annotations
 
 import asyncio
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -32,6 +33,11 @@ class Session:
     cwd: Path
     current_role: str
     notebook: Notebook
+    # Stable opaque identifier for this conversation. ``session_id`` is
+    # derived from the WeCom chat/user identity and is also used as the
+    # workspace key; this UUID is safe to send to upstream LLM gateways in
+    # the ``x-session-id`` request header and survives process restarts.
+    session_uuid: str = field(default_factory=lambda: str(uuid.uuid4()))
     agents_by_role: dict[str, "Agent"] = field(default_factory=dict)
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     pending_handoff: PendingHandoff | None = None

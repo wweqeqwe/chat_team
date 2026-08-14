@@ -119,6 +119,7 @@ async def _summarize(
         temperature=0.0,
         reasoning_effort=(agent.settings.llm.chat.reasoning_effort or "").strip() or None,
         session_id=agent.session.session_id,
+        session_uuid=agent.session.session_uuid,
         role_name=agent.role.name,
         call_kind="compactor",
         debug_log_dir=agent.session.cwd / ".chat_team" / "llm",

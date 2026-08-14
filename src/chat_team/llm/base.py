@@ -56,6 +56,10 @@ class CompletionRequest:
     # provider writes one JSON file per call. All four are optional so
     # legacy/test call sites stay valid.
     session_id: str | None = None
+    # Stable conversation UUID sent as the ``x-session-id`` HTTP header when
+    # the provider makes an upstream model request. Kept separate from the
+    # internal WeCom-derived session_id for privacy and backward compatibility.
+    session_uuid: str | None = None
     role_name: str | None = None
     call_kind: str | None = None  # "agent" | "compactor" | "vision"
     debug_log_dir: Path | None = None

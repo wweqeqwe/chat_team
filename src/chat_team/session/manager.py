@@ -26,6 +26,7 @@ import asyncio
 import logging
 import os
 import time
+import uuid
 from collections import OrderedDict
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -40,6 +41,15 @@ if TYPE_CHECKING:
     from .persistence import PersistenceManager
 
 log = logging.getLogger(__name__)
+
+
+def _session_uuid_from_state(state: dict) -> str:
+    """Read a persisted conversation UUID, or create one for legacy state."""
+    raw = state.get("session_uuid")
+    try:
+        return str(uuid.UUID(str(raw)))
+    except (AttributeError, ValueError, TypeError):
+        return str(uuid.uuid4())
 
 
 class SessionManager:
@@ -120,6 +130,7 @@ class SessionManager:
         if self._solo_role:
             state_filename = f"session-{self._solo_role}.json"
             current_role = self._solo_role
+            prior = load_state(cwd, state_filename) or {}
             prior_histories = restored_histories(cwd, state_filename)
         else:
             state_filename = "session.json"
@@ -132,6 +143,7 @@ class SessionManager:
             cwd=cwd,
             current_role=current_role,
             notebook=notebook,
+            session_uuid=_session_uuid_from_state(prior),
             restored_histories=prior_histories,
             state_filename=state_filename,
         )

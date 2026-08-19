@@ -8,7 +8,8 @@ Covers six independent items:
 3. `run_command` subprocess does not inherit secrets-bearing env vars.
 4. `SessionManager` LRU evicts past the cap, flushing the victim first.
 5. Janitor unlinks old files in inbox/runs/llm subdirs on first touch.
-6. LLM retry: transient errors retried with backoff; non-transient raised.
+6. LLM retry: transient errors and empty completions are retried; tool calls
+   with empty text remain valid; non-transient errors are raised.
 
 All tests are pure-Python: no live WS, no live LLM, no network.
 """
@@ -33,7 +34,7 @@ from chat_team.agent.tools.base import ToolContext
 from chat_team.agent.tools.shell_tool import RunCommandTool, _scrub_env
 from chat_team.config import load_settings
 from chat_team.llm.base import CompletionRequest, ChatMessage
-from chat_team.llm.openai_provider import OpenAIChatCompletionProvider
+from chat_team.llm.openai_provider import OpenAIChatCompletionProvider, _strip_thinking_markup
 from chat_team.session.manager import SessionManager
 from chat_team.session.persistence import PersistenceManager
 
@@ -345,21 +346,21 @@ class _FakeUsage:
 
 
 class _FakeMessage:
-    def __init__(self, content="ok"):
+    def __init__(self, content="ok", tool_calls=None):
         self.role = "assistant"
         self.content = content
-        self.tool_calls = []
+        self.tool_calls = list(tool_calls or [])
 
 
 class _FakeChoice:
-    def __init__(self):
-        self.message = _FakeMessage("retried-ok")
-        self.finish_reason = "stop"
+    def __init__(self, content="retried-ok", tool_calls=None, finish_reason="stop"):
+        self.message = _FakeMessage(content, tool_calls)
+        self.finish_reason = finish_reason
 
 
 class _FakeCompletion:
-    def __init__(self):
-        self.choices = [_FakeChoice()]
+    def __init__(self, content="retried-ok", tool_calls=None, finish_reason="stop"):
+        self.choices = [_FakeChoice(content, tool_calls, finish_reason)]
         self.usage = _FakeUsage()
 
 
@@ -376,6 +377,20 @@ class _FakeChatCompletionsCreator:
             err = self._errors.pop(0)
             raise err
         return _FakeCompletion()
+
+
+class _ScriptedCompletionCreator:
+    """Return scripted completions in order."""
+
+    def __init__(self, completions: list[_FakeCompletion]):
+        self._completions = list(completions)
+        self.call_count = 0
+
+    async def create(self, **kwargs):
+        self.call_count += 1
+        if not self._completions:
+            raise AssertionError("unexpected extra completion call")
+        return self._completions.pop(0)
 
 
 def _install_fake_client(provider, fake):
@@ -479,6 +494,109 @@ async def test_llm_no_retry_on_4xx():
     print("  ✓ non-transient 4xx raised on first attempt, no retry")
 
 
+async def test_llm_retries_empty_completion():
+    print("== test 12: LLM retries empty no-tool completions ==")
+    for use_streaming in (True, False):
+        provider = OpenAIChatCompletionProvider(
+            api_key="test",
+            max_retries=3,
+            retry_initial_delay=0.0,
+            use_streaming=use_streaming,
+        )
+        fake = _ScriptedCompletionCreator([
+            _FakeCompletion(content=""),
+            _FakeCompletion(content=" \n\t"),
+            _FakeCompletion(content="recovered"),
+        ])
+        _install_fake_client(provider, fake)
+
+        req = CompletionRequest(
+            messages=[ChatMessage(role="user", content="hi")],
+            model="gpt-4o-mini",
+            temperature=0.0,
+        )
+        resp = await provider.complete(req)
+        assert resp.message.content == "recovered", resp.message
+        assert fake.call_count == 3, fake.call_count
+    print("  ✓ streaming and non-streaming both retry until visible text")
+
+
+async def test_llm_rejects_exhausted_empty_completions():
+    print("== test 13: LLM raises after empty completions exhaust retries ==")
+    provider = OpenAIChatCompletionProvider(
+        api_key="test", max_retries=2, retry_initial_delay=0.0,
+    )
+    fake = _ScriptedCompletionCreator([
+        _FakeCompletion(content=""),
+        _FakeCompletion(content=" "),
+    ])
+    _install_fake_client(provider, fake)
+
+    req = CompletionRequest(
+        messages=[ChatMessage(role="user", content="hi")],
+        model="gpt-4o-mini",
+        temperature=0.0,
+    )
+    try:
+        await provider.complete(req)
+    except RuntimeError as exc:
+        assert type(exc).__name__ == "_EmptyCompletionError", type(exc).__name__
+    else:
+        raise AssertionError("empty completions should not be returned as success")
+    assert fake.call_count == 2, fake.call_count
+    print("  ✓ exhausted empty responses raise instead of ending the turn")
+
+
+async def test_llm_accepts_tool_call_without_text():
+    print("== test 14: LLM accepts a tool call with empty text ==")
+
+    class _Function:
+        name = "lookup"
+        arguments = '{"plate":"粤A12345"}'
+
+    class _ToolCall:
+        id = "call-1"
+        function = _Function()
+
+    provider = OpenAIChatCompletionProvider(
+        api_key="test", max_retries=3, retry_initial_delay=0.0,
+    )
+    fake = _ScriptedCompletionCreator([
+        _FakeCompletion(
+            content="",
+            tool_calls=[_ToolCall()],
+            finish_reason="tool_calls",
+        ),
+    ])
+    _install_fake_client(provider, fake)
+
+    req = CompletionRequest(
+        messages=[ChatMessage(role="user", content="hi")],
+        model="gpt-4o-mini",
+        temperature=0.0,
+    )
+    resp = await provider.complete(req)
+    assert resp.message.content == ""
+    assert len(resp.message.tool_calls) == 1
+    assert resp.message.tool_calls[0].name == "lookup"
+    assert fake.call_count == 1, fake.call_count
+    print("  ✓ valid tool-only response succeeds without retry")
+
+async def test_strip_thinking_markup_wrappers():
+    print("== test 15: reasoning wrappers strip to visible answer, non-wrappers survive ==")
+    short_open = "\x3c" + "think" + "\x3e"
+    short_close = "\x3c" + "/think" + "\x3e"
+    long_open = "\x3c" + "thinking" + "\x3e"
+    long_close = "\x3c" + "/thinking" + "\x3e"
+    assert _strip_thinking_markup(short_open + " 推理 " + short_close + "\n\n你好") == "你好"
+    assert _strip_thinking_markup(long_open + " 推理 " + long_close + "\n你好") == "你好"
+    assert _strip_thinking_markup(short_open + " 只有推理没有正文") == ""
+    assert _strip_thinking_markup(long_open + " 只有推理没有正文") == ""
+    assert _strip_thinking_markup("\x3c车牌\x3e 浙E·P671T") == "\x3c车牌\x3e 浙E·P671T"
+    assert _strip_thinking_markup("普通回复") == "普通回复"
+    assert _strip_thinking_markup("") == ""
+    print("  ✓ short/long wrappers stripped; unrelated tags and plain text preserved")
+
 # --------------------------------------------------------------------------
 
 async def main():
@@ -493,6 +611,10 @@ async def main():
     await test_llm_retry_on_transient_error()
     await test_llm_exhausts_retries()
     await test_llm_no_retry_on_4xx()
+    await test_llm_retries_empty_completion()
+    await test_llm_rejects_exhausted_empty_completions()
+    await test_llm_accepts_tool_call_without_text()
+    await test_strip_thinking_markup_wrappers()
     print("\nALL P0 SMOKE TESTS PASSED")
 
 

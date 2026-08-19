@@ -53,6 +53,8 @@ HEARTBEAT_INTERVAL = 30
 STREAM_PUSH_MIN_INTERVAL = 1.0          # seconds between intermediate stream frames
 WRITE_QUEUE_MAXSIZE = 1024
 INBOUND_PREFETCH_TIMEOUT_SECONDS = 240.0
+STREAM_CONTENT_MAX_BYTES = 2048            # WeCom silently drops larger stream refresh/final frames
+MARKDOWN_CONTENT_MAX_BYTES = 20 * 1024     # documented markdown.content limit
 
 # Reconnect backoff: 1s, 2s, 4s, … capped at 5 min; +0.5s jitter per attempt.
 RECONNECT_INITIAL_DELAY = 1.0
@@ -152,6 +154,14 @@ class _InboundQueue:
     worker: asyncio.Task | None = None
 
 
+def _truncate_utf8(text: str, max_bytes: int) -> str:
+    """Truncate ``text`` to at most ``max_bytes`` of UTF-8 without splitting a codepoint."""
+    encoded = text.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return text
+    return encoded[:max_bytes].decode("utf-8", errors="ignore")
+
+
 class WeComStreamHandle:
     """Streaming reply backed by aibot_respond_msg / msgtype=stream.
 
@@ -169,6 +179,8 @@ class WeComStreamHandle:
 
     async def push(self, chunk: str, *, append: bool = True) -> None:
         if self._closed:
+            return
+        if not chunk.strip():
             return
         self._content = (self._content + chunk) if append else chunk
         if time.monotonic() - self._last_push < STREAM_PUSH_MIN_INTERVAL:
@@ -189,9 +201,20 @@ class WeComStreamHandle:
             return
         self._closed = True
         text = final_text or "(空回复)"
-        await self._send_frame(text, finish=True)
+        log.info(
+            "wecom stream finish: role=%s req_id=%s bytes=%d",
+            self._adapter.role_name, self._req_id, len(text.encode("utf-8")),
+        )
+        # Close the live "思考中…" stream with a plain-text frame first, then
+        # send the actual response as a markdown message.  WeCom stream frames
+        # are intended for transient plain-text status; sending markdown inside
+        # ``stream.content`` (tables/heavy bold/headings) often fails silently
+        # and leaves the prior spinner text on screen.
+        await self._send_frame("处理完成。", finish=True)
+        await self._adapter._send_markdown_reply(self._req_id, text)
 
     async def _send_frame(self, content: str, *, finish: bool) -> None:
+        content = _truncate_utf8(content, STREAM_CONTENT_MAX_BYTES)
         payload = {
             "cmd": "aibot_respond_msg",
             "headers": {"req_id": self._req_id},
@@ -444,6 +467,15 @@ class WeComBotAdapter(BotAdapter):
                     log.warning("dropping non-json frame: %r", raw[:200])
                     continue
                 cmd = msg.get("cmd") or ""
+                if cmd in ("aibot_msg_callback", "aibot_event_callback"):
+                    body = msg.get("body") or {}
+                    log.info(
+                        "wecom inbound callback: cmd=%s msgtype=%s session=%s msgid=%s",
+                        cmd,
+                        body.get("msgtype"),
+                        self._session_id_from_body(body),
+                        body.get("msgid"),
+                    )
                 if cmd == "aibot_msg_callback":
                     order_key = self._reserve_inbound_order(msg)
                     self._spawn_bg(
@@ -466,6 +498,19 @@ class WeComBotAdapter(BotAdapter):
 
     async def _enqueue_write(self, payload: dict[str, Any]) -> None:
         await self._write_queue.put(payload)
+
+    async def _send_markdown_reply(self, req_id: str, content: str) -> None:
+        """Send a full-size answer as a markdown reply after the short stream close."""
+        content = _truncate_utf8(content, MARKDOWN_CONTENT_MAX_BYTES)
+        payload = {
+            "cmd": "aibot_respond_msg",
+            "headers": {"req_id": req_id},
+            "body": {
+                "msgtype": "markdown",
+                "markdown": {"content": content},
+            },
+        }
+        await self._enqueue_write(payload)
 
     def _spawn_bg(self, coro, *, name: str | None = None) -> asyncio.Task:
         """Create a background task and hold a strong reference to it until

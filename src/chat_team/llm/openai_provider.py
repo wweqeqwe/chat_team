@@ -39,12 +39,49 @@ log = logging.getLogger(__name__)
 
 _OPENCODE_USER_AGENT = "OpenCode/1.0"
 
+
+class _EmptyCompletionError(RuntimeError):
+    """The model completed without visible text or tool calls."""
+
+
 _RETRYABLE_EXCEPTIONS: tuple[type[BaseException], ...] = (
     APITimeoutError,
     APIConnectionError,
     RateLimitError,
     InternalServerError,
+    _EmptyCompletionError,
 )
+
+
+_THINKING_PAIRS: tuple[tuple[str, str], ...] = (
+    ("<thinking>", "</thinking>"),
+    # xmz-text-model returns a short think wrapper without the "ing".
+    # Keep the long form first for unambiguous prefix matching.
+    ("<think>", "</think>"),
+)
+
+def _strip_thinking_markup(content: str) -> str:
+    """Remove provider-wrapped reasoning text.
+
+    Upstream providers wrap reasoning in either
+    "<thinking>...</thinking>" or the shorter " thinking... response" and place
+    the visible answer after it. Keep only the answer so reasoning never shows
+    to users or leaks into history.
+
+    An unmatched reasoning opener means only reasoning was produced with no
+    answer; strip it to empty so the provider's empty-completion retry asks
+    again. Content that merely starts with a non-reasoning "<" tag is left as
+    is.
+    """
+    if not content:
+        return content
+    stripped = content.lstrip()
+    for open_tag, close_tag in _THINKING_PAIRS:
+        if stripped.startswith(open_tag):
+            if close_tag in content:
+                return content.split(close_tag, 1)[1].strip()
+            return ""
+    return content
 
 
 def _supports_reasoning_effort(model: str) -> bool:
@@ -362,7 +399,7 @@ class OpenAIChatCompletionProvider(LLMProvider):
                 except Exception:                                 # noqa: BLE001
                     usage = None
             return (
-                ChatMessage(role="assistant", content=msg.content or "", tool_calls=tool_calls),
+                ChatMessage(role="assistant", content=_strip_thinking_markup(msg.content or ""), tool_calls=tool_calls),
                 choice.finish_reason or "stop",
                 usage,
                 completion,
@@ -394,10 +431,12 @@ class OpenAIChatCompletionProvider(LLMProvider):
             if part:
                 content_parts.append(part)
                 if stream_text_callback is not None:
-                    try:
-                        await stream_text_callback("".join(content_parts))
-                    except Exception:                             # noqa: BLE001
-                        log.debug("stream_text_callback failed", exc_info=True)
+                    display = _strip_thinking_markup("".join(content_parts))
+                    if display:
+                        try:
+                            await stream_text_callback(display)
+                        except Exception:                             # noqa: BLE001
+                            log.debug("stream_text_callback failed", exc_info=True)
             for tc in (getattr(delta, "tool_calls", None) or []):
                 idx = getattr(tc, "index", None)
                 if idx is None:
@@ -422,7 +461,7 @@ class OpenAIChatCompletionProvider(LLMProvider):
         return (
             ChatMessage(
                 role="assistant",
-                content="".join(content_parts),
+                content=_strip_thinking_markup("".join(content_parts)),
                 tool_calls=self._build_tool_calls_from_deltas(tool_calls_by_index),
             ),
             finish_reason,
@@ -496,8 +535,14 @@ class OpenAIChatCompletionProvider(LLMProvider):
                     attempts += 1
                     key_attempts += 1
                     try:
+                        candidate_completion = None
                         if self._use_streaming:
-                            response_msg, finish_reason, usage, raw_obj = (
+                            (
+                                candidate_response_msg,
+                                candidate_finish_reason,
+                                candidate_usage,
+                                candidate_raw_obj,
+                            ) = (
                                 await self._complete_with_streaming(
                                     kwargs,
                                     stream_text_callback=request.stream_text_callback,
@@ -505,7 +550,50 @@ class OpenAIChatCompletionProvider(LLMProvider):
                                 )
                             )
                         else:
-                            completion = await client.chat.completions.create(**kwargs)
+                            candidate_completion = await client.chat.completions.create(**kwargs)
+                            choice = candidate_completion.choices[0]
+                            msg = choice.message
+                            candidate_tool_calls: list[ToolCall] = []
+                            for tc in (msg.tool_calls or []):
+                                try:
+                                    args = json.loads(tc.function.arguments or "{}")
+                                except json.JSONDecodeError:
+                                    args = {"_raw": tc.function.arguments}
+                                candidate_tool_calls.append(
+                                    ToolCall(
+                                        id=tc.id,
+                                        name=tc.function.name,
+                                        arguments=args,
+                                    )
+                                )
+                            candidate_response_msg = ChatMessage(
+                                role="assistant",
+                                content=_strip_thinking_markup(msg.content or ""),
+                                tool_calls=candidate_tool_calls,
+                            )
+                            candidate_finish_reason = choice.finish_reason or "stop"
+                            candidate_usage = None
+                            if getattr(candidate_completion, "usage", None) is not None:
+                                try:
+                                    candidate_usage = candidate_completion.usage.model_dump()
+                                except Exception:                         # noqa: BLE001
+                                    candidate_usage = None
+                            candidate_raw_obj = candidate_completion
+
+                        if (
+                            not candidate_response_msg.tool_calls
+                            and not _content_as_string(candidate_response_msg.content).strip()
+                        ):
+                            raise _EmptyCompletionError(
+                                "model returned no visible content or tool calls "
+                                f"(finish_reason={candidate_finish_reason!r})"
+                            )
+
+                        completion = candidate_completion
+                        response_msg = candidate_response_msg
+                        finish_reason = candidate_finish_reason
+                        usage = candidate_usage
+                        raw_obj = candidate_raw_obj
                         succeeded = True
                         last_exc = None
                         break
@@ -579,7 +667,7 @@ class OpenAIChatCompletionProvider(LLMProvider):
                 tool_calls.append(ToolCall(id=tc.id, name=tc.function.name, arguments=args))
             response_msg = ChatMessage(
                 role="assistant",
-                content=msg.content or "",
+                content=_strip_thinking_markup(msg.content or ""),
                 tool_calls=tool_calls,
             )
             finish_reason = choice.finish_reason or "stop"

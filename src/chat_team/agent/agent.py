@@ -44,6 +44,8 @@ log = logging.getLogger(__name__)
 # Sentinel used by _run_tools_parallel to defer a TransferRequested re-raise
 # until after all parallel results have been appended to history.
 _TRANSFER_RAISE_SENTINEL: Any = object()
+_TOOL_ERROR_PREFIX = "[tool_error] "
+_CIRCUIT_BREAKER_ERROR_MAX_CHARS = 1000
 
 PYTHON_UV_CONVENTION = """[Python 执行约定]
 当你需要执行 Python 脚本且引入第三方库时,请使用 PEP 723 inline metadata + `uv run`,不要直接 `pip install` 也不要假设库已安装:
@@ -288,10 +290,7 @@ class Agent:
             if self._maybe_break_circuit(
                 call, result, repeated_error_counts, threshold,
             ):
-                return (
-                    "我尝试了多次执行该操作但均被系统策略拒绝,可能是因为缺少必要的关键词。"
-                    "如需生成报告,请回复『报告』或『出报告』等关键词,我会立即为您处理。"
-                )
+                return self._circuit_breaker_reply(call, result, threshold)
         except Exception as err:               # noqa: BLE001
             log.exception("tool %s raised", call.name)
             result = f"[tool_error] {type(err).__name__}: {err}"
@@ -358,9 +357,8 @@ class Agent:
                     call, result, repeated_error_counts, threshold,
                 ):
                     if fallback_reply is None:
-                        fallback_reply = (
-                            "我尝试了多次执行该操作但均被系统策略拒绝,可能是因为缺少必要的关键词。"
-                            "如需生成报告,请回复『报告』或『出报告』等关键词,我会立即为您处理。"
+                        fallback_reply = self._circuit_breaker_reply(
+                            call, result, threshold,
                         )
                     # History already appended by _maybe_break_circuit.
                     continue
@@ -381,6 +379,24 @@ class Agent:
                 r for r in raw_results if isinstance(r, TransferRequested)
             )
         return fallback_reply
+
+    @staticmethod
+    def _circuit_breaker_reply(
+        call: ToolCall,
+        result: str,
+        threshold: int,
+    ) -> str:
+        """Build a truthful, bounded user-facing reply for a stuck tool."""
+        error = result.removeprefix(_TOOL_ERROR_PREFIX).strip()
+        if not error:
+            error = "工具未返回具体错误信息"
+        if len(error) > _CIRCUIT_BREAKER_ERROR_MAX_CHARS:
+            error = error[:_CIRCUIT_BREAKER_ERROR_MAX_CHARS].rstrip() + "…"
+        return (
+            f"操作未完成：工具「{call.name}」使用相同参数连续失败 "
+            f"{threshold} 次，已停止自动重试。\n"
+            f"错误原因：{error}"
+        )
 
     def _maybe_break_circuit(
         self,

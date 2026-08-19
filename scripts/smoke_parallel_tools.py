@@ -140,6 +140,20 @@ class SerialSleepTool(Tool):
         return f"{self.name}:ok"
 
 
+class SerialFailTool(Tool):
+    """A non-parallel-safe tool that always returns the same ToolError."""
+
+    name = "serial_fail"
+    description = "always fails"
+    parameters = {
+        "type": "object",
+        "properties": {"plate": {"type": "string"}},
+    }
+
+    async def run(self, ctx: ToolContext, **kwargs: Any) -> str:
+        raise ToolError("车牌「true」未找到")
+
+
 def reply(text: str) -> CompletionResponse:
     return CompletionResponse(
         message=ChatMessage(role="assistant", content=text),
@@ -483,6 +497,84 @@ async def test_unknown_tool_in_batch_falls_serial():
     print("  unknown tool in batch → serial fallback: OK")
 
 
+async def test_serial_circuit_breaker_reports_real_error():
+    """Serial breaker names the real tool and exposes its last ToolError."""
+    home = Path("/tmp/chat_team_parallel_smoke")
+    shutil.rmtree(home, ignore_errors=True)
+    home.mkdir(parents=True)
+    (home / "config.yaml").write_text("")
+    settings = load_settings()
+
+    reg = ToolRegistry()
+    reg.register(SerialFailTool())
+    llm = ScriptedLLM([
+        multi_call([("serial_fail", {"plate": "true"}, "tc-1")]),
+        multi_call([("serial_fail", {"plate": "true"}, "tc-2")]),
+        multi_call([("serial_fail", {"plate": "true"}, "tc-3")]),
+    ])
+    agent = make_agent(
+        home, settings, reg, llm, role_tools=["serial_fail"],
+    )
+
+    result = await agent.handle("查询车牌", CapturingStream())
+
+    assert "工具「serial_fail」" in result
+    assert "车牌「true」未找到" in result
+    assert "连续失败 3 次" in result
+    assert "系统策略拒绝" not in result
+    assert "出报告" not in result
+    tool_msgs = [m for m in agent.history if m.role == "tool"]
+    assert len(tool_msgs) == 3
+    assert tool_msgs[-1].content == "[tool_error] 车牌「true」未找到"
+    print("  serial circuit breaker reports real tool/error: OK")
+
+
+async def test_parallel_circuit_breaker_reports_bounded_real_error():
+    """Parallel breaker uses the same reply and bounds oversized errors."""
+    home = Path("/tmp/chat_team_parallel_smoke")
+    shutil.rmtree(home, ignore_errors=True)
+    home.mkdir(parents=True)
+    (home / "config.yaml").write_text("")
+    settings = load_settings()
+
+    long_error = "WeCom 上游错误：" + ("X" * 1200)
+
+    class ErrorResultSession:
+        async def call_tool(
+            self, name: str, arguments: dict | None = None, **kwargs,
+        ) -> FakeCallToolResult:
+            return FakeCallToolResult(
+                content=[FakeTextContent(text=long_error)],
+                isError=True,
+            )
+
+    reg = ToolRegistry()
+    reg.register(McpProxyTool(
+        "wecom", FakeMcpTool(name="update_description"), ErrorResultSession(),
+    ))
+    tool_name = "mcp__wecom__update_description"
+    llm = ScriptedLLM([
+        multi_call([(tool_name, {"plate": "true"}, "tc-1")]),
+        multi_call([(tool_name, {"plate": "true"}, "tc-2")]),
+        multi_call([(tool_name, {"plate": "true"}, "tc-3")]),
+    ])
+    agent = make_agent(
+        home, settings, reg, llm, role_tools=[], mcp_servers=["wecom"],
+    )
+
+    result = await agent.handle("更新客户描述", CapturingStream())
+
+    assert f"工具「{tool_name}」" in result
+    assert "WeCom 上游错误：" in result
+    assert result.endswith("…")
+    assert len(result) < len(long_error)
+    assert "系统策略拒绝" not in result
+    tool_msgs = [m for m in agent.history if m.role == "tool"]
+    assert len(tool_msgs) == 3
+    assert long_error in tool_msgs[-1].content
+    print("  parallel circuit breaker reports bounded real tool/error: OK")
+
+
 async def main() -> None:
     print("=== Parallel tool dispatch smoke tests ===")
 
@@ -495,6 +587,8 @@ async def main() -> None:
     await test_parallel_error_isolation()
     await test_parallel_single_call_still_works()
     await test_unknown_tool_in_batch_falls_serial()
+    await test_serial_circuit_breaker_reports_real_error()
+    await test_parallel_circuit_breaker_reports_bounded_real_error()
 
     print("\nALL PARALLEL TOOL SMOKE TESTS PASSED")
 

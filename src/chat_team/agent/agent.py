@@ -141,11 +141,35 @@ class Agent:
 
     def _effective_tool_names(self) -> list[str]:
         names = list(self.role.tools)
+        all_names = self.tools.names()
         if self.role.mcp_servers:
-            all_names = self.tools.names()
             for s in self.role.mcp_servers:
                 prefix = f"mcp__{s}__"
                 names.extend(n for n in all_names if n.startswith(prefix))
+        for server_name, tool_filter in self.role.mcp_tools.items():
+            prefix = f"mcp__{server_name}__"
+            selected_tools = set(tool_filter.tools)
+            available_tools = {
+                n[len(prefix):] for n in all_names if n.startswith(prefix)
+            }
+            unknown_tools = selected_tools - available_tools
+            if unknown_tools:
+                log.warning(
+                    "role %r mcp_tools[%r] references unknown tool(s): %s",
+                    self.role.name,
+                    server_name,
+                    ", ".join(sorted(unknown_tools)),
+                )
+
+            def tool_is_allowed(name: str) -> bool:
+                if not name.startswith(prefix):
+                    return True
+                original_name = name[len(prefix):]
+                if tool_filter.mode == "whitelist":
+                    return original_name in selected_tools
+                return original_name not in selected_tools
+
+            names = [name for name in names if tool_is_allowed(name)]
         return names
 
     # ---- main loop ---------------------------------------------------------

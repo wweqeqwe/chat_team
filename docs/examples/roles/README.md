@@ -43,6 +43,12 @@ tools:                          # 必填,从 app.build_tool_registry 注册过�
 mcp_servers:                    # 可选,引用 config.yaml 中 mcp.servers 下的服务器名
   - filesystem                  # 该角色自动获得此 MCP 服务器暴露的所有工具
 
+mcp_tools:                      # 可选,按角色、按 server 设置白名单/黑名单
+  filesystem:
+    mode: blacklist             # whitelist=只暴露 tools 列表;blacklist=屏蔽 tools 列表
+    tools:
+      - write_file              # 写原始 MCP 工具名,不写 mcp__filesystem__ 前缀
+
 llm:                            # 可选,留空就用全局默认
   model: ""                     # 例如 "gpt-4o-mini"
   temperature: 0.3
@@ -59,6 +65,8 @@ welcome_message: |              # 可选,enter_chat 事件里 default_role 会�
 MCP 工具无需在 `tools:` 列表中单独列出 —— 只要在 `mcp_servers:` 中写服务器名,
 该服务器的所有工具就会自动暴露给这个角色。MCP 服务器在 `~/.chat_team/config.yaml`
 的 `mcp.servers` 节定义,参见 `config.yaml` 中的注释示例。
+如需按角色限制,用 `mcp_tools`:未配置的 server 继续暴露全部工具;
+`mode: whitelist` 只暴露列出的原始工具名,`mode: blacklist` 屏蔽列出的原始工具名。
 
 如果同名 YAML 同时出现在 `~/.chat_team/roles/` 和 `src/chat_team/roles/builtin/`,
 **用户目录的优先**。这意味着你也可以覆盖 `team_admin` 自己重写。

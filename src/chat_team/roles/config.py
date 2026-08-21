@@ -22,6 +22,14 @@ class RoleLLMConfig:
 
 
 @dataclass
+class RoleMcpToolFilter:
+    """Per-role, per-server MCP tool allow/deny policy."""
+
+    mode: str                          # "whitelist" or "blacklist"
+    tools: list[str] = field(default_factory=list)
+
+
+@dataclass
 class Role:
     name: str
     display_name: str
@@ -30,6 +38,7 @@ class Role:
     tools: list[str] = field(default_factory=list)
     skills: list[str] = field(default_factory=list)
     mcp_servers: list[str] = field(default_factory=list)
+    mcp_tools: dict[str, RoleMcpToolFilter] = field(default_factory=dict)
     llm: RoleLLMConfig = field(default_factory=RoleLLMConfig)
     welcome_message: str | None = None   # used for enter_chat events
 
@@ -61,6 +70,44 @@ class Role:
             isinstance(s, str) for s in mcp_servers_raw
         ):
             raise ValueError("role yaml 'mcp_servers' must be a list of strings")
+        mcp_tools_raw = raw.get("mcp_tools") or {}
+        if not isinstance(mcp_tools_raw, dict):
+            raise ValueError("role yaml 'mcp_tools' must be a mapping")
+        mcp_tools: dict[str, RoleMcpToolFilter] = {}
+        mcp_servers = list(mcp_servers_raw)
+        for server_name, filter_raw in mcp_tools_raw.items():
+            if server_name not in mcp_servers:
+                raise ValueError(
+                    "role yaml 'mcp_tools' references a server not listed in "
+                    f"'mcp_servers': {server_name!r}"
+                )
+            if not isinstance(filter_raw, dict):
+                raise ValueError(
+                    f"role yaml 'mcp_tools.{server_name}' must be a mapping"
+                )
+            mode = filter_raw.get("mode")
+            if mode not in ("whitelist", "blacklist"):
+                raise ValueError(
+                    f"role yaml 'mcp_tools.{server_name}.mode' must be "
+                    "'whitelist' or 'blacklist'"
+                )
+            filter_tools_raw = filter_raw.get("tools") or []
+            if not isinstance(filter_tools_raw, list) or not all(
+                isinstance(tool_name, str) and tool_name
+                for tool_name in filter_tools_raw
+            ):
+                raise ValueError(
+                    f"role yaml 'mcp_tools.{server_name}.tools' must be a "
+                    "list of non-empty tool-name strings"
+                )
+            if len(filter_tools_raw) != len(set(filter_tools_raw)):
+                raise ValueError(
+                    f"role yaml 'mcp_tools.{server_name}.tools' contains duplicates"
+                )
+            mcp_tools[server_name] = RoleMcpToolFilter(
+                mode=mode,
+                tools=list(filter_tools_raw),
+            )
         return cls(
             name=name,
             display_name=raw.get("display_name", name),
@@ -69,6 +116,7 @@ class Role:
             tools=list(raw.get("tools") or []),
             skills=list(skills_raw),
             mcp_servers=list(mcp_servers_raw),
+            mcp_tools=mcp_tools,
             llm=llm,
             welcome_message=raw.get("welcome_message"),
         )

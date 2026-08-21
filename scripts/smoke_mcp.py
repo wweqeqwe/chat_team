@@ -35,7 +35,7 @@ from chat_team.llm.base import (
 )
 from chat_team.mcp.config import McpServerConfig
 from chat_team.mcp.proxy_tool import McpProxyTool
-from chat_team.roles.config import Role
+from chat_team.roles.config import Role, RoleMcpToolFilter
 from chat_team.roles.registry import RoleRegistry
 from chat_team.session.manager import SessionManager
 from chat_team.session.notebook import Notebook
@@ -650,6 +650,80 @@ def test_effective_tool_names():
     print("  effective tool names: OK")
 
 
+def test_effective_tool_names_blacklist():
+    """Role-level blacklist removes one MCP tool, even if explicitly listed."""
+    home = Path("/tmp/chat_team_mcp_smoke")
+    os.environ.setdefault("OPENAI_API_KEY", "test")
+    (home / "config.yaml").write_text("")
+    settings = load_settings()
+
+    reg = ToolRegistry()
+    session = FakeMcpSession()
+    reg.register(McpProxyTool("weather", FakeMcpTool(name="get_weather"), session))
+    reg.register(McpProxyTool("weather", FakeMcpTool(name="get_forecast"), session))
+
+    role = Role(
+        name="test",
+        display_name="Test",
+        description="",
+        system_prompt="you are a test",
+        tools=["mcp__weather__get_forecast"],
+        mcp_servers=["weather"],
+        mcp_tools={"weather": RoleMcpToolFilter(
+            mode="blacklist",
+            tools=["get_forecast"],
+        )},
+    )
+    agent = Agent(
+        role=role, session=make_session("s1", home), settings=settings,
+        llm=ScriptedLLM([]), tools=reg, skills=SkillRegistry({}),
+    )
+
+    names = agent._effective_tool_names()
+    assert "mcp__weather__get_weather" in names
+    assert "mcp__weather__get_forecast" not in names
+    print("  effective tool names (blacklist): OK")
+
+
+def test_effective_tool_names_whitelist():
+    """Role-level whitelist exposes only the selected MCP tools."""
+    home = Path("/tmp/chat_team_mcp_smoke")
+    os.environ.setdefault("OPENAI_API_KEY", "test")
+    (home / "config.yaml").write_text("")
+    settings = load_settings()
+
+    reg = ToolRegistry()
+    session = FakeMcpSession()
+    reg.register(McpProxyTool("weather", FakeMcpTool(name="get_weather"), session))
+    reg.register(McpProxyTool("weather", FakeMcpTool(name="get_forecast"), session))
+    reg.register(McpProxyTool("files", FakeMcpTool(name="read_file"), session))
+
+    role = Role(
+        name="test",
+        display_name="Test",
+        description="",
+        system_prompt="you are a test",
+        tools=[],
+        mcp_servers=["weather", "files"],
+        mcp_tools={
+            "weather": RoleMcpToolFilter(
+                mode="whitelist",
+                tools=["get_weather"],
+            ),
+        },
+    )
+    agent = Agent(
+        role=role, session=make_session("s1", home), settings=settings,
+        llm=ScriptedLLM([]), tools=reg, skills=SkillRegistry({}),
+    )
+
+    names = agent._effective_tool_names()
+    assert "mcp__weather__get_weather" in names
+    assert "mcp__weather__get_forecast" not in names
+    assert "mcp__files__read_file" in names
+    print("  effective tool names (whitelist): OK")
+
+
 def test_effective_tool_names_no_mcp():
     """No mcp_servers → only role.tools returned."""
     home = Path("/tmp/chat_team_mcp_smoke")
@@ -691,6 +765,27 @@ def test_role_mcp_servers_parsing():
     })
     assert role2.mcp_servers == []
     print("  role mcp_servers parsing: OK")
+
+
+def test_role_mcp_tools_parsing():
+    """Role.from_dict parses per-server whitelist/blacklist policies."""
+    role = Role.from_dict({
+        "name": "test",
+        "display_name": "Test",
+        "description": "",
+        "system_prompt": "test",
+        "tools": [],
+        "mcp_servers": ["weather", "files"],
+        "mcp_tools": {
+            "weather": {"mode": "blacklist", "tools": ["get_forecast"]},
+            "files": {"mode": "whitelist", "tools": ["read_file"]},
+        },
+    })
+    assert role.mcp_tools["weather"].mode == "blacklist"
+    assert role.mcp_tools["weather"].tools == ["get_forecast"]
+    assert role.mcp_tools["files"].mode == "whitelist"
+    assert role.mcp_tools["files"].tools == ["read_file"]
+    print("  role mcp_tools parsing: OK")
 
 
 async def test_agent_invokes_mcp_tool():
@@ -764,8 +859,11 @@ async def main() -> None:
     test_config_tool_timeout_default()
     test_registry_names()
     test_effective_tool_names()
+    test_effective_tool_names_blacklist()
+    test_effective_tool_names_whitelist()
     test_effective_tool_names_no_mcp()
     test_role_mcp_servers_parsing()
+    test_role_mcp_tools_parsing()
     await test_agent_invokes_mcp_tool()
 
     print("\nALL MCP SMOKE TESTS PASSED")

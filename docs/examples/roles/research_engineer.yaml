@@ -29,6 +29,17 @@ tools:
 # mcp_servers:
 #   - filesystem
 #   - github
+#
+# 可选:按角色限制 MCP 工具。tools 里写原始 MCP 工具名(不带 mcp__server__ 前缀)。
+# mcp_tools:
+#   filesystem:
+#     mode: blacklist
+#     tools:
+#       - write_file
+#   github:
+#     mode: whitelist
+#     tools:
+#       - search_issues
 
 llm:
   model: ""

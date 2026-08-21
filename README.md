@@ -250,9 +250,16 @@ Transport is auto-detected: `command` → stdio, `url` → SSE. Server names mus
 name: developer
 tools: [read_file, write_file, run_command, transfer_to_employee]
 mcp_servers: [filesystem, github]        # This role can use all tools from these two servers
+mcp_tools:                               # Optional per-server allow/deny policy
+  filesystem:
+    mode: blacklist                      # whitelist or blacklist
+    tools: [write_file]                  # Original MCP tool names
+  github:
+    mode: whitelist
+    tools: [search_issues, get_issue]
 ```
 
-MCP tools are registered as `mcp__<server>__<tool>` (e.g., `mcp__filesystem__read_file`). Agents invoke them using the original tool name without needing to know the prefix.
+MCP tools are registered as `mcp__<server>__<tool>` (e.g., `mcp__filesystem__read_file`). Agents invoke them using the original tool name without needing to know the prefix. `mcp_tools` is configured in each role YAML and applies to original MCP tool names (without the proxy prefix); servers without an entry expose all tools to that role. Role YAML changes are hot-reloadable, while MCP server configuration changes still require a bot restart.
 
 **Limitations**: Currently only supports MCP Tools (not Resources / Prompts); MCP config changes require bot restart; `chat-team-tools` CLI does not list MCP tools (dynamically discovered at runtime).
 
@@ -321,7 +328,7 @@ For detailed architecture, subtle mechanics, and pitfalls to avoid, see [`CLAUDE
 - **Single instance per BotID**. WeCom enforces "new connection kicks old"; the same BotID cannot run multiple replicas simultaneously (they will kick each other). Solo mode allows managing multiple different BotIDs in one process, but each BotID still supports only one connection.
 - **OpenAI Chat Completion only**. Anthropic / Gemini support planned via `LLMProvider` subclass extension.
 - **Media upload supports images / files only** (`send_image` / `send_file` tools via `aibot_upload_media_init/chunk/finish`); voice / video not yet supported.
-- **No hot-reload for configuration**. Changes to `team.md`, Role YAML, Skills, or MCP config require bot restart.
+- **MCP server configuration is restart-only**. Role YAML, team.md, and skills support hot reload; changing MCP servers, transports, credentials, or the process-wide MCP timeout/output limits requires a bot restart.
 - **`chat-team-tools` CLI does not list MCP tools**. MCP tools are dynamically discovered at runtime; CLI only shows statically registered built-in tools.
 - **Vision `direct` mode consumes significantly more tokens than `tool` mode**. Raw image base64 injection costs ~1600 tokens per 1024² image; default `tool` mode converts to text via upfront OCR, reducing token overhead by ~6×. Increase `history_token_budget` when enabling `direct`.
 - **No cross-bot active notifications in Solo mode**. Other bots won't automatically detect notebook updates; rely on prompt agreements or manual `notebook_read`.

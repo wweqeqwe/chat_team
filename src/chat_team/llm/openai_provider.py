@@ -84,14 +84,6 @@ def _strip_thinking_markup(content: str) -> str:
     return content
 
 
-def _supports_reasoning_effort(model: str) -> bool:
-    m = (model or "").lower().strip()
-    return (
-        m.startswith(("o1", "o3", "o4", "gpt-5"))
-        or "reason" in m
-    )
-
-
 @dataclass
 class _HttpLogContext:
     dir_path: Path
@@ -502,7 +494,7 @@ class OpenAIChatCompletionProvider(LLMProvider):
         if request.max_tokens:
             kwargs["max_tokens"] = request.max_tokens
         effort = (request.reasoning_effort or "").strip()
-        if effort and _supports_reasoning_effort(request.model):
+        if effort:
             kwargs["reasoning_effort"] = effort
 
         t0 = time.monotonic()

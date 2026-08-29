@@ -75,8 +75,8 @@ class CapturingStream:
 class ScriptedLLM(LLMProvider):
     """Dispenses scripted CompletionResponses; used for non-summary calls.
 
-    For summarize calls (no tools, system content starts with '你是会话历史压缩器'),
-    returns a canned summary. Otherwise pops from the queue.
+    For sterile or cache-aware summarize calls, returns a canned summary.
+    Otherwise pops from the queue.
     """
 
     def __init__(self, responses):
@@ -85,8 +85,18 @@ class ScriptedLLM(LLMProvider):
 
     async def complete(self, request):
         self.requests.append(request)
-        if request.messages and request.messages[0].role == "system" and \
-           "会话历史压缩器" in (request.messages[0].content or ""):
+        is_sterile_compactor = (
+            request.messages
+            and request.messages[0].role == "system"
+            and "会话历史压缩器" in (request.messages[0].content or "")
+        )
+        is_cache_aware_compactor = any(
+            m.role == "system"
+            and isinstance(m.content, str)
+            and "[系统维护任务：历史压缩]" in m.content
+            for m in request.messages
+        )
+        if is_sterile_compactor or is_cache_aware_compactor:
             return CompletionResponse(
                 message=ChatMessage(role="assistant", content="(压缩摘要) 用户主要诉求与历史决策的要点。"),
                 finish_reason="stop",
@@ -155,9 +165,11 @@ async def test_compactor_prefix_summarised():
     assert agent.history[0].role == "system"
     assert "历史摘要" in agent.history[0].content
     assert agent.history[1].role == "user"
-    # Kept window = last 6 user turns × 2 messages each = 12 messages.
-    # Plus the summary head = 13 total.
-    assert len(agent.history) == 13, f"unexpected length {len(agent.history)}"
+    # The target-token policy keeps as many complete recent turns as fit.
+    # With this deliberately tiny budget, only the latest complete turn fits.
+    assert len(agent.history) == 3, f"unexpected length {len(agent.history)}"
+    assert "用户第 9 次问题" in (agent.history[1].content or "")
+    assert "回答 9" in (agent.history[2].content or "")
 
 
 # --------------------------------------------------------------------------
@@ -207,9 +219,56 @@ async def test_compactor_six_turns_still_compacts():
     assert agent.history[0].role == "system"
     assert "历史摘要" in (agent.history[0].content or "")
     assert agent.history[1].role == "user"
-    # One oldest user→assistant turn compacted into a summary head.
-    assert len(agent.history) == 11, f"unexpected length {len(agent.history)}"
-    print("  ok — compacted oldest turn while keeping recent context")
+    # Tiny target → summary + latest complete user/assistant turn.
+    assert len(agent.history) == 3, f"unexpected length {len(agent.history)}"
+    assert "用户问题 5" in (agent.history[1].content or "")
+    assert "回答 5" in (agent.history[2].content or "")
+    print("  ok — compacted to target while keeping latest complete turn")
+
+
+async def test_cache_aware_compactor_extends_last_agent_request():
+    print("== test 2c: compactor extends exact last agent request ==")
+    settings = load_settings()
+    roles = RoleRegistry.load(settings.paths.user_roles_dir)
+    tools = ToolRegistry()
+    tools.register(TransferToEmployeeTool(available_employees=roles.names()))
+    sessions = SessionManager(settings)
+    sess = await sessions.get_or_create("sess-cache-aware")
+    role = roles.get("team_admin")
+    role.llm.history_token_budget = 99999
+    llm = ScriptedLLM([
+        reply("第一轮回答。" + "a" * 100),
+        reply("第二轮回答。" + "b" * 100),
+    ])
+    agent = Agent(
+        role=role, session=sess, settings=settings, llm=llm, tools=tools,
+    )
+    stream = CapturingStream()
+    await agent.handle("第一轮问题。" + "x" * 100, stream)
+    await agent.handle("第二轮问题。" + "y" * 100, stream)
+
+    base_request = agent.last_completion_request
+    assert base_request is not None
+    base_messages = list(base_request.messages)
+    base_tools = list(base_request.tools)
+
+    role.llm.history_token_budget = 20
+    did = await maybe_compact(agent, llm)
+    assert did
+    compact_request = llm.requests[-1]
+    assert compact_request.call_kind == "compactor"
+    assert compact_request.messages[:len(base_messages)] == base_messages
+    assert compact_request.tools == base_tools
+    assert compact_request.model == base_request.model
+    assert compact_request.temperature == base_request.temperature
+    assert compact_request.reasoning_effort == base_request.reasoning_effort
+    assert compact_request.messages[-1].role == "system"
+    assert "[系统维护任务：历史压缩]" in (
+        compact_request.messages[-1].content or ""
+    )
+    assert agent.history[0].role == "system"
+    assert agent.history[1].role == "user"
+    print("  ok — previous request is an exact message/tool prefix")
 
 
 # --------------------------------------------------------------------------
@@ -351,6 +410,7 @@ async def main():
     await test_compactor_prefix_summarised()
     await test_compactor_skipped_when_under_budget()
     await test_compactor_six_turns_still_compacts()
+    await test_cache_aware_compactor_extends_last_agent_request()
     await test_persistence_round_trip()
     await test_persistence_debounced_fires()
     await test_persistence_list_content_round_trip()

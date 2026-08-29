@@ -2,7 +2,8 @@
 
 * Multi-hop transfer in a single user turn (admin → engineer → customer).
 * Per-turn transfer cap forces an answer after the 3rd handoff attempt.
-* Handoff note shows up as a system message visible to the receiving agent.
+* Handoff note is prepended to the receiving agent's next user turn so the
+  prior request remains an exact cache prefix.
 """
 from __future__ import annotations
 
@@ -131,19 +132,19 @@ async def test_chain_within_cap():
     assert sess.current_role == "customer"
     assert "小客" in s.final
 
-    # The handoff note is a one-shot system inject — it lives in the
-    # outgoing LLM request, not in agent.history (so we don't double-emit
-    # it every turn). Verify it appeared in the customer's first request.
-    cust_requests = [
-        r for r in llm.requests
-        if any(m.role == "system" and "small system note" or True for m in r.messages)
-    ]
-    # find the request that customer agent issued (after 2 transfers — it's the 3rd request)
+    # The handoff note is a one-shot context block inside the next persisted
+    # user message.  It must not be inserted as a leading system message,
+    # because that would invalidate an existing target agent's prompt cache.
     third_request = llm.requests[2]
     sys_msgs = [m.content for m in third_request.messages if m.role == "system"]
-    assert any("代码看完了" in s for s in sys_msgs), \
-        f"handoff note missing in customer's request system msgs: {sys_msgs}"
-    print("  ✓ handoff note visible to customer's LLM request")
+    assert not any("代码看完了" in s for s in sys_msgs)
+    user_msgs = [m.content for m in third_request.messages if m.role == "user"]
+    assert any(
+        isinstance(content, str) and "代码看完了" in content
+        and "[系统上下文通知 — 非用户输入]" in content
+        for content in user_msgs
+    ), f"handoff note missing in customer's user context: {user_msgs}"
+    print("  ✓ handoff note appended with customer's next user turn")
 
 
 async def test_cap_forces_answer():

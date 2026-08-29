@@ -268,7 +268,7 @@ class Dispatcher:
                         "session %s hit transfer cap %d; forcing %s to answer",
                         session.session_id, cap, session.current_role,
                     )
-                    agent.queue_system_note(
+                    agent.queue_context_note(
                         f"[强制回答] 你已经在本轮触发过 {cap} 次员工交接,"
                         f"现在必须直接给用户答复,不再调用 transfer_to_employee。"
                     )
@@ -278,7 +278,7 @@ class Dispatcher:
                     )
                 if not self.roles.has(t.target):
                     log.warning("transfer target %s unknown; staying with %s", t.target, session.current_role)
-                    agent.queue_system_note(
+                    agent.queue_context_note(
                         f"[交接失败] 没有名为 {t.target} 的同事,请直接回答用户。"
                     )
                     return await agent.handle(
@@ -318,7 +318,7 @@ class Dispatcher:
                 "session %s: transfer attempted in solo mode; ignoring",
                 session.session_id,
             )
-            agent.queue_system_note("[系统] 当前为独立模式,无法转接给其他员工,请直接回答用户。")
+            agent.queue_context_note("[系统] 当前为独立模式,无法转接给其他员工,请直接回答用户。")
             return await agent.handle(
                 "(系统提示: 当前为独立模式,请直接回答用户的提问。)",
                 stream,
@@ -330,7 +330,7 @@ class Dispatcher:
         h = session.pending_handoff
         if h.to_role != agent.role.name:
             return
-        agent.queue_system_note(
+        agent.queue_context_note(
             f"[交接备忘] 来自同事 {h.from_role}。原因: {h.reason}\n备忘: {h.note}\n"
             "请基于此备忘和团队记事本继续服务用户;若你也认为应该再次转给别人,请慎重。"
         )

@@ -8,6 +8,7 @@ The 4KB soft cap is enforced on write — if exceeded, ``write`` raises
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -124,6 +125,24 @@ class Notebook:
         if not keys:
             return "(empty)"
         return ", ".join(f"{k}({index.get(k, '?')})" for k in keys)
+
+    def revision(self) -> str:
+        """Stable digest of the notebook content and its TOC metadata.
+
+        Agents use this to notice cross-role writes without rebuilding their
+        leading system prompt on every LLM tool loop.  The notebook is capped
+        at a few KB, so hashing both files is cheaper and more reliable than
+        timestamp polling (same-day overwrites keep the TOC date unchanged).
+        """
+        digest = hashlib.blake2s(digest_size=16)
+        for path in (self.path, self.index_path):
+            try:
+                payload = path.read_bytes()
+            except FileNotFoundError:
+                payload = b""
+            digest.update(len(payload).to_bytes(8, "big"))
+            digest.update(payload)
+        return digest.hexdigest()
 
     def __iter__(self) -> Iterator[tuple[str, str]]:
         return iter(self._load_blocks().items())

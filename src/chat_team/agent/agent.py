@@ -9,7 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
 
 from ..adapters.base import ContentBlock, StreamHandle
@@ -69,20 +69,80 @@ class Agent:
     skills: "SkillRegistry | None" = None
     vision_llm: LLMProvider | None = None
     history: list[ChatMessage] = field(default_factory=list)
-    pending_system_inject: list[str] = field(default_factory=list)
+    pending_context_notes: list[str] = field(default_factory=list)
+    notebook_toc_snapshot: str = field(init=False)
+    notebook_seen_revision: str = field(init=False)
+    # Exact successful agent request most recently sent upstream.  The
+    # compactor extends this request instead of constructing an unrelated
+    # prompt, allowing upstream prefix/KV caches to reuse the agent context.
+    last_completion_request: CompletionRequest | None = field(
+        default=None, init=False, repr=False,
+    )
+    last_request_history_len: int = field(default=0, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self.refresh_notebook_snapshot()
 
     def reset_turn(self) -> None:
         # Clear per-turn buffers; called when caller hands a new user message.
         pass
 
+    def refresh_notebook_snapshot(self) -> None:
+        """Refresh the stable system-prompt TOC at a natural cache boundary."""
+        self.notebook_toc_snapshot = self.session.notebook.toc()
+        self.notebook_seen_revision = self.session.notebook.revision()
+
+    def queue_context_note(self, note: str) -> None:
+        """Prepend a one-shot context block to the next persisted user turn.
+
+        Appending the note with the next user message keeps the prior LLM
+        request as an exact prefix.  Injecting it before ``history`` as a new
+        system message would invalidate the whole cached conversation.
+        """
+        clean = (note or "").strip()
+        if clean:
+            self.pending_context_notes.append(clean)
+
     def queue_system_note(self, note: str) -> None:
-        """Inject a one-shot system message at the start of the next chat call."""
-        self.pending_system_inject.append(note)
+        """Backward-compatible alias for the cache-safe context-note path."""
+        self.queue_context_note(note)
+
+    def _queue_notebook_update_if_needed(self) -> None:
+        revision = self.session.notebook.revision()
+        if revision == self.notebook_seen_revision:
+            return
+        toc = self.session.notebook.toc()
+        self.queue_context_note(
+            "[团队记事本更新]\n"
+            "记事本内容或目录自你上次请求后已发生变化。\n"
+            f"当前目录: {toc}\n"
+            "需要共享事实时请调用 notebook_read 获取最新内容。"
+        )
+        self.notebook_seen_revision = revision
+
+    def _consume_context_notes(
+        self,
+        user_content: str | list[ContentBlock],
+    ) -> str | list[ContentBlock]:
+        notes = list(self.pending_context_notes)
+        self.pending_context_notes.clear()
+        if not notes:
+            return user_content
+        context = (
+            "[系统上下文通知 — 非用户输入]\n"
+            + "\n\n".join(notes)
+            + "\n\n[以下为用户本条消息]"
+        )
+        if isinstance(user_content, list):
+            return [
+                {"type": "text", "text": context},
+                *user_content,
+            ]
+        return f"{context}\n{user_content}"
 
     # ---- prompt assembly ---------------------------------------------------
 
     def _build_system_messages(self) -> list[ChatMessage]:
-        toc = self.session.notebook.toc()
         blocks: list[str] = [self.role.system_prompt]
         if self.settings.team_profile:
             blocks.append("[团队信息]\n" + self.settings.team_profile)
@@ -98,17 +158,13 @@ class Agent:
         blocks.append("\n".join([
             f"[当前角色] {self.role.name} ({self.role.display_name})",
             f"[当前工作目录] {self.session.cwd}",
-            f"[团队记事本目录] {toc}",
+            f"[团队记事本目录] {self.notebook_toc_snapshot}",
             isolation,
             "[路径规则] 业务输入/输出文件必须位于当前工作目录及其子目录;"
             "调用 skill 脚本时可进入 skill 目录执行,但 --input/--output 仍必须指向当前工作目录内的文件。",
         ]))
         full = "\n\n".join(b for b in blocks if b).strip()
-        msgs = [ChatMessage(role="system", content=full)]
-        for note in self.pending_system_inject:
-            msgs.append(ChatMessage(role="system", content=note))
-        self.pending_system_inject.clear()
-        return msgs
+        return [ChatMessage(role="system", content=full)]
 
     def _all_employee_roster_keys(self) -> list[str]:
         # placeholder for future employee roster; kept to avoid future refactor.
@@ -188,6 +244,12 @@ class Agent:
         # call leaves a dangling user message; a failed mid-tool-loop call
         # leaves an assistant(tool_calls) without all of its tool replies.
         pre_turn_len = len(self.history)
+        pre_pending_context_notes = list(self.pending_context_notes)
+        pre_notebook_seen_revision = self.notebook_seen_revision
+        pre_last_request = self.last_completion_request
+        pre_last_request_history_len = self.last_request_history_len
+        self._queue_notebook_update_if_needed()
+        user_content = self._consume_context_notes(user_content)
         self.history.append(ChatMessage(role="user", content=user_content))
 
         # Per-turn circuit breaker: when the same (tool, args) raises
@@ -220,6 +282,17 @@ class Agent:
                     stream_text_callback=lambda text: stream.push(text, append=False),
                 )
                 response = await self.llm.complete(request)
+                # Keep the exact prompt-shaping fields for cache-aware
+                # compaction, but do not retain the per-turn callback closure
+                # (it captures the stream handle and can otherwise extend its
+                # lifetime until the next request).
+                self.last_completion_request = replace(
+                    request,
+                    messages=list(request.messages),
+                    tools=list(request.tools),
+                    stream_text_callback=None,
+                )
+                self.last_request_history_len = len(self.history)
                 assistant = response.message
                 self.history.append(assistant)
 
@@ -272,6 +345,10 @@ class Agent:
             # request). We re-raise so CancelledError keeps propagating up to
             # the dispatcher's busy-state cleanup in its finally block.
             del self.history[pre_turn_len:]
+            self.notebook_seen_revision = pre_notebook_seen_revision
+            self.last_completion_request = pre_last_request
+            self.last_request_history_len = pre_last_request_history_len
+            self.pending_context_notes = pre_pending_context_notes
             raise
 
     def _is_parallel_safe(self, name: str) -> bool:
@@ -297,6 +374,11 @@ class Agent:
         await stream.status(f"调用工具: {call.name}")
         try:
             result = await self._invoke_tool(call, stream)
+            if call.name in {"notebook_write", "notebook_delete"}:
+                # The writer already learned the change from this tool result;
+                # suppress a redundant next-turn directory notification while
+                # keeping the leading system TOC snapshot unchanged.
+                self.notebook_seen_revision = self.session.notebook.revision()
         except TransferRequested as transfer:
             # Close the dangling tool_call in our own history so this role's
             # transcript stays well-formed if it's revisited. Don't roll

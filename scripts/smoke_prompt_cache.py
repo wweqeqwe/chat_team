@@ -3,6 +3,7 @@
 Pure Python / scripted LLM:
 * notebook writes never rewrite the leading system prompt;
 * notebook and handoff updates are appended with the next user turn;
+* compaction refreshes the TOC without swallowing an unseen notebook update;
 * compaction extends the exact last agent request (messages + tools).
 """
 from __future__ import annotations
@@ -243,6 +244,45 @@ async def test_compactor_extends_last_request() -> None:
     print("  PASS")
 
 
+async def test_compaction_preserves_unseen_same_key_update() -> None:
+    print("== compaction preserves an unseen same-key notebook update ==")
+    llm = ScriptedLLM([
+        reply("第一轮回答 " + "a" * 120),
+        reply("第二轮回答 " + "b" * 120),
+        reply("已读取压缩后通知"),
+    ])
+    agent = await build_agent("compactor-notebook-update", llm)
+    agent.session.notebook.write("same-key", "旧值")
+    agent.refresh_notebook_snapshot()
+    old_toc = agent.notebook_toc_snapshot
+    old_revision = agent.notebook_seen_revision
+
+    agent.role.llm.history_token_budget = 99999
+    await agent.handle("第一轮问题 " + "x" * 120, CapturingStream())
+    await agent.handle("第二轮问题 " + "y" * 120, CapturingStream())
+
+    # Same-day overwrite: revision changes while the key/date TOC is exactly
+    # equal.  Refreshing the TOC during compaction must not acknowledge this
+    # unseen content update.
+    agent.session.notebook.write("same-key", "来自另一个机器人的新值")
+    assert agent.session.notebook.toc() == old_toc
+    assert agent.session.notebook.revision() != old_revision
+
+    agent.role.llm.history_token_budget = 20
+    assert await maybe_compact(agent, llm)
+    assert agent.notebook_toc_snapshot == old_toc
+    assert agent.notebook_seen_revision == old_revision
+
+    await agent.handle("压缩后继续", CapturingStream())
+    request = llm.requests[-1]
+    user = request.messages[-1]
+    assert user.role == "user"
+    assert isinstance(user.content, str)
+    assert user.content.count("[团队记事本更新]") == 1
+    assert "same-key" in user.content
+    print("  PASS")
+
+
 async def main() -> None:
     await test_notebook_write_keeps_system_prefix()
     await test_notebook_update_is_appended_once()
@@ -250,6 +290,7 @@ async def main() -> None:
     await test_notebook_update_retry_is_not_duplicated()
     await test_handoff_note_is_prefix_extension()
     await test_compactor_extends_last_request()
+    await test_compaction_preserves_unseen_same_key_update()
     print("\nALL PROMPT-CACHE SMOKE TESTS PASSED")
 
 

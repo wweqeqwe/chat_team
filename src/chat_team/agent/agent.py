@@ -79,6 +79,11 @@ class Agent:
         default=None, init=False, repr=False,
     )
     last_request_history_len: int = field(default=0, init=False, repr=False)
+    # Suppresses repeated warnings when an unchanged single-turn history is
+    # over budget but has no safe user boundary to compact.
+    last_uncompactable_signature: tuple[int, int, int] | None = field(
+        default=None, init=False, repr=False,
+    )
 
     def __post_init__(self) -> None:
         self.refresh_notebook_snapshot()
@@ -87,10 +92,17 @@ class Agent:
         # Clear per-turn buffers; called when caller hands a new user message.
         pass
 
-    def refresh_notebook_snapshot(self) -> None:
-        """Refresh the stable system-prompt TOC at a natural cache boundary."""
+    def refresh_notebook_snapshot(self, *, mark_seen: bool = True) -> None:
+        """Refresh the stable system-prompt TOC at a natural cache boundary.
+
+        ``mark_seen=False`` updates the prompt snapshot without acknowledging
+        an unseen cross-role write.  Compaction uses that mode so the next
+        user turn still receives an explicit append-only update notification,
+        including when an existing key changed but the TOC text stayed equal.
+        """
         self.notebook_toc_snapshot = self.session.notebook.toc()
-        self.notebook_seen_revision = self.session.notebook.revision()
+        if mark_seen:
+            self.notebook_seen_revision = self.session.notebook.revision()
 
     def queue_context_note(self, note: str) -> None:
         """Prepend a one-shot context block to the next persisted user turn.

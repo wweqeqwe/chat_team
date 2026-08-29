@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import shutil
 import sys
@@ -193,6 +194,57 @@ async def test_compactor_skipped_when_under_budget():
     assert not did
     assert len(agent.history) == 2
     print("  ok — no compaction")
+
+
+async def test_uncompactable_state_warns_once():
+    print("== test 2a: unchanged uncompactable state warns once ==")
+    settings = load_settings()
+    roles = RoleRegistry.load(settings.paths.user_roles_dir)
+    tools = ToolRegistry()
+    sessions = SessionManager(settings)
+    sess = await sessions.get_or_create("sess-uncompactable")
+    role = roles.get("team_admin")
+    role.llm.history_token_budget = 20
+    llm = ScriptedLLM([])
+    agent = Agent(
+        role=role, session=sess, settings=settings, llm=llm, tools=tools,
+    )
+    agent.history.extend([
+        ChatMessage(role="user", content="单轮超长问题 " + "x" * 300),
+        ChatMessage(role="assistant", content="单轮超长回答 " + "y" * 300),
+    ])
+
+    records: list[logging.LogRecord] = []
+
+    class _CollectHandler(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    logger = logging.getLogger("chat_team.agent.compactor")
+    handler = _CollectHandler(level=logging.WARNING)
+    old_level = logger.level
+    logger.addHandler(handler)
+    logger.setLevel(logging.WARNING)
+    try:
+        assert not await maybe_compact(agent, llm)
+        assert not await maybe_compact(agent, llm)
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(old_level)
+
+    blocked = [
+        r for r in records
+        if "nothing safe to compact" in r.getMessage()
+    ]
+    assert len(blocked) == 1, [r.getMessage() for r in records]
+    assert blocked[0].levelno == logging.WARNING
+
+    # Returning under budget clears the suppression signature so a future,
+    # newly changed oversized state can report itself again.
+    role.llm.history_token_budget = count_tokens(agent.history) + 1
+    assert not await maybe_compact(agent, llm)
+    assert agent.last_uncompactable_signature is None
+    print("  ok — one WARNING per unchanged state")
 
 
 async def test_compactor_six_turns_still_compacts():
@@ -409,6 +461,7 @@ async def test_persistence_list_content_round_trip():
 async def main():
     await test_compactor_prefix_summarised()
     await test_compactor_skipped_when_under_budget()
+    await test_uncompactable_state_warns_once()
     await test_compactor_six_turns_still_compacts()
     await test_cache_aware_compactor_extends_last_agent_request()
     await test_persistence_round_trip()

@@ -16,7 +16,7 @@ WeCom (Enterprise WeChat) AI Bot — supports two deployment modes:
 - **Role = YAML File**: Add roles without modifying dispatch code; place in `~/.chat_team/roles/` to override built-ins.
 - **Session-Level Tool Sandbox**: File I/O and shell commands are restricted to `~/.chat_team/workspaces/<sid>/`. Path traversal, absolute paths, and symlink escapes are rejected. Shell output exceeding thresholds is truncated, with full logs saved for review.
 - **Shared Notebook**: A "team whiteboard" across employees — Markdown file with `## key` blocks. History only sees the TOC; values are fetched on-demand via `notebook_read` to avoid context pollution.
-- **Auto Compaction**: Independent token budget per role. When exceeded, early messages are summarized by LLM and prepended to history.
+- **Auto Compaction**: Independent token budget per role. When exceeded, early messages are summarized by LLM and prepended to history; up to six recent complete turns are retained verbatim while targeting 60% of the budget, with at least the latest complete turn always preserved.
 - **Persistence**: `session.json` is debounced (10s) and written atomically. Session history and current active role survive restarts.
 - **Media Handling**: Images/files/videos are decrypted using per-message AES-256-CBC keys and saved to `<cwd>/inbox/`. Agents receive text pointers.
 - **Eager Image OCR**: Under default `vision_strategy=tool`, inbound images are **automatically OCR'd upfront**. Descriptions are injected as `[image:relative_path]\n<description>` into user messages, keeping agent history text-only and token consumption predictable. Raw images only enter context when a role explicitly sets `vision_strategy: direct`.

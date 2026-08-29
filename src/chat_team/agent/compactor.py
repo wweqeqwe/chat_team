@@ -210,29 +210,18 @@ async def _summarize_cache_aware(
     request = replace(
         base,
         messages=messages,
-        # Preserve model, temperature, reasoning, image settings and tools
-        # from the cached request.  These debug/callback fields do not enter
-        # the upstream prompt and are safe to change.
+        # Deliberately preserve model, temperature, reasoning, image settings
+        # and tools from the cached request.  Temperature does not alter KV
+        # computation in principle, but an OpenAI-compatible upstream may
+        # still include generation parameters in its cache key.  ``call_kind``
+        # and the callback are local-only metadata and safe to change.
         call_kind="compactor",
-        debug_log_dir=agent.session.cwd / ".chat_team" / "llm",
         stream_text_callback=None,
     )
     resp = await llm.complete(request)
     if resp.message.tool_calls:
         raise RuntimeError("cache-aware compactor returned tool calls")
     return (resp.message.content or "").strip()
-
-
-async def _summarize(
-    prefix: list[ChatMessage],
-    suffix: list[ChatMessage],
-    llm: LLMProvider,
-    *,
-    agent: "Agent",
-) -> str:
-    return await _summarize_cache_aware(
-        prefix, suffix, llm, agent=agent,
-    )
 
 
 async def maybe_compact(agent: "Agent", llm: LLMProvider) -> bool:
@@ -242,9 +231,11 @@ async def maybe_compact(agent: "Agent", llm: LLMProvider) -> bool:
         or agent.settings.llm.chat.history_token_budget
     )
     if budget <= 0:
+        agent.last_uncompactable_signature = None
         return False
     tokens = count_tokens(agent.history)
     if tokens <= budget:
+        agent.last_uncompactable_signature = None
         return False
 
     target_tokens = max(1, int(budget * COMPACTION_TARGET_RATIO))
@@ -254,19 +245,27 @@ async def maybe_compact(agent: "Agent", llm: LLMProvider) -> bool:
         target_tokens=target_tokens,
     )
     if boundary <= 0:
-        log.info(
-            "role=%s over budget (%d > %d) but has <=1 user turn; nothing safe to compact",
-            agent.role.name, tokens, budget,
-        )
+        signature = (len(agent.history), tokens, budget)
+        if agent.last_uncompactable_signature != signature:
+            log.warning(
+                "role=%s over budget (%d > %d) but has <=1 user turn; "
+                "nothing safe to compact (increase history_token_budget or "
+                "reduce the per-turn payload)",
+                agent.role.name, tokens, budget,
+            )
+            agent.last_uncompactable_signature = signature
         return False
 
+    agent.last_uncompactable_signature = None
     prefix = agent.history[:boundary]
     suffix = agent.history[boundary:]
     if not prefix:
         return False
 
     try:
-        summary = await _summarize(prefix, suffix, llm, agent=agent)
+        summary = await _summarize_cache_aware(
+            prefix, suffix, llm, agent=agent,
+        )
     except Exception:                                         # noqa: BLE001
         log.exception("summarize failed for role=%s; leaving history intact", agent.role.name)
         return False
@@ -287,10 +286,13 @@ async def maybe_compact(agent: "Agent", llm: LLMProvider) -> bool:
     # be reused for another maintenance call.  The next normal agent request
     # establishes the new compacted prefix.  Refreshing the notebook snapshot
     # here is free from an additional cache perspective because compaction
-    # already changed the history head.
+    # already changed the history head.  Do not mark the current notebook
+    # revision as seen: a cross-role write that happened before this
+    # compaction still needs one explicit append-only notice next turn,
+    # especially when an existing key changed without altering the TOC text.
     agent.last_completion_request = None
     agent.last_request_history_len = 0
-    agent.refresh_notebook_snapshot()
+    agent.refresh_notebook_snapshot(mark_seen=False)
     compacted_tokens = count_tokens(agent.history)
     log.info(
         "compacted role=%s: %d msgs / %d tokens → %d msgs / %d tokens "

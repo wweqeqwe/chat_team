@@ -176,9 +176,15 @@ class WeComStreamHandle:
         self._content = ""
         self._last_push = 0.0
         self._closed = False
+        # Set by the adapter when WeCom rejects a stream frame with errcode
+        # 846608 (stream update window expired, >10 minutes after the
+        # inbound message). push()/status() become no-ops; finish() skips
+        # the closing stream frame but still attempts the markdown reply.
+        self.expired = False
+        adapter._active_streams[req_id] = self
 
     async def push(self, chunk: str, *, append: bool = True) -> None:
-        if self._closed:
+        if self._closed or self.expired:
             return
         if not chunk.strip():
             return
@@ -187,30 +193,44 @@ class WeComStreamHandle:
             return                                          # throttle silently
         await self._send_frame(self._content, finish=False)
 
-    async def status(self, note: str) -> None:
-        if self._closed:
-            return
+    async def status(self, note: str) -> bool:
+        """Push a transient status frame.
+
+        Returns ``False`` once the stream is closed or WeCom-expired so
+        long-running callers (the dispatcher progress heartbeat) can stop
+        pushing instead of generating one rejected frame per interval.
+        """
+        if self._closed or self.expired:
+            return False
         if time.monotonic() - self._last_push < STREAM_PUSH_MIN_INTERVAL:
-            return
+            return True                      # throttled, but stream alive
         # status messages don't accumulate into the body; they're transient.
         await self._send_frame(f"{self._content}\n\n_{note}_" if self._content else f"_{note}_",
                                finish=False)
+        return True
 
     async def finish(self, final_text: str) -> None:
         if self._closed:
             return
         self._closed = True
+        cur = self._adapter._active_streams.get(self._req_id)
+        if cur is self:
+            self._adapter._active_streams.pop(self._req_id, None)
         text = final_text or "(空回复)"
         log.info(
-            "wecom stream finish: role=%s req_id=%s bytes=%d",
+            "wecom stream finish: role=%s req_id=%s bytes=%d expired=%s",
             self._adapter.role_name, self._req_id, len(text.encode("utf-8")),
+            self.expired,
         )
         # Close the live "思考中…" stream with a plain-text frame first, then
         # send the actual response as a markdown message.  WeCom stream frames
         # are intended for transient plain-text status; sending markdown inside
         # ``stream.content`` (tables/heavy bold/headings) often fails silently
-        # and leaves the prior spinner text on screen.
-        await self._send_frame("处理完成。", finish=True)
+        # and leaves the prior spinner text on screen.  When the stream is
+        # already WeCom-expired the closing frame would just be rejected with
+        # 846608 — skip it, but still attempt the markdown reply.
+        if not self.expired:
+            await self._send_frame("处理完成。", finish=True)
         await self._adapter._send_markdown_reply(self._req_id, text)
 
     async def _send_frame(self, content: str, *, finish: bool) -> None:
@@ -290,6 +310,12 @@ class WeComBotAdapter(BotAdapter):
         # Recreated per connection so a fresh wait() resolves correctly.
         self._connection_dead = asyncio.Event()
         self._pending_acks: dict[str, asyncio.Future] = {}
+        # Live stream handles keyed by inbound req_id. Populated by
+        # WeComStreamHandle.__init__, removed by finish(). Used by
+        # _dispatch_ack to mark a stream expired when WeCom answers a
+        # stream frame with errcode 846608 (>10min update window), so the
+        # progress heartbeat stops pushing into a dead stream.
+        self._active_streams: dict[str, "WeComStreamHandle"] = {}
 
     # ---- BotAdapter interface ---------------------------------------------
 
@@ -917,8 +943,26 @@ class WeComBotAdapter(BotAdapter):
         # routable rather than silently dropped.
         return [{"type": "text", "text": f"[未支持: {msgtype}]"}]
 
+    # WeCom errcode for "stream message update expired (>10 minutes),
+    # cannot update". Stream frames (and the progress heartbeat) for this
+    # req_id are dead; mark the handle so pushers stop.
+    _STREAM_EXPIRED_ERRCODE = 846608
+
     def _dispatch_ack(self, msg: dict[str, Any]) -> None:
         req_id = (msg.get("headers") or {}).get("req_id")
+        if (
+            req_id
+            and msg.get("errcode") == self._STREAM_EXPIRED_ERRCODE
+            and req_id in self._active_streams
+        ):
+            handle = self._active_streams[req_id]
+            if not handle.expired:
+                handle.expired = True
+                log.info(
+                    "wecom stream expired (>10min) for req_id=%s; "
+                    "stopping further stream pushes",
+                    req_id,
+                )
         fut = self._pending_acks.pop(req_id, None) if req_id else None
         if fut is not None and not fut.done():
             fut.set_result(msg)

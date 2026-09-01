@@ -150,9 +150,17 @@ class Dispatcher:
 
         while not stop.is_set():
             try:
-                await stream.status(text)
+                alive = await stream.status(text)
             except Exception:                                  # noqa: BLE001
                 log.debug("progress status push failed", exc_info=True)
+            else:
+                if alive is False:
+                    # Stream expired upstream (WeCom rejects updates >10min
+                    # after the inbound message, errcode 846608). Pushing
+                    # further only generates rejected frames — stop, but let
+                    # the turn itself keep running.
+                    log.debug("progress heartbeat stopping: stream expired")
+                    return
             try:
                 await asyncio.wait_for(stop.wait(), timeout=interval)
             except asyncio.TimeoutError:

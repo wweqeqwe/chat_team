@@ -96,6 +96,14 @@ class LLMConfig:
     max_retries: int = 3
     retry_initial_delay: float = 1.0
     max_tool_loops_per_turn: int = 16
+    # Per-turn circuit breaker for IDENTICAL-ARGS SUCCESSES: when the same
+    # (tool, arguments) call succeeds this many times within one turn the
+    # loop is force-broken with a fallback reply. Complements the hardcoded
+    # identical-ToolError breaker (3) in Agent: production showed an agent
+    # re-issuing the exact same OCR call 97 times, each call succeeding,
+    # hoping for a different answer. Re-asking the identical question adds
+    # no information, so this is safe to keep low.
+    repeated_success_break_threshold: int = 5
 
 
 @dataclass

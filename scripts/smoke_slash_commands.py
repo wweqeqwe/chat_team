@@ -143,7 +143,16 @@ def text_frame(
 
 
 def reply_text(sent_frames: list[dict]) -> str | None:
-    """Pull the content of the last aibot_respond_msg stream frame."""
+    """Pull the reply content out of sent frames.
+
+    finish() delivers the real answer as a markdown frame after closing the
+    live stream with a plain "处理完成。" frame, so prefer the markdown
+    content and fall back to the last stream frame for legacy shapes.
+    """
+    for fr in reversed(sent_frames):
+        body = fr.get("body") or {}
+        if fr.get("cmd") == "aibot_respond_msg" and body.get("msgtype") == "markdown":
+            return (body.get("markdown") or {}).get("content")
     for fr in reversed(sent_frames):
         body = fr.get("body") or {}
         if fr.get("cmd") == "aibot_respond_msg" and body.get("msgtype") == "stream":

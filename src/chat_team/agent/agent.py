@@ -272,6 +272,14 @@ class Agent:
         # entire max_tool_loops_per_turn budget on one stubborn call.
         repeated_error_counts: dict[tuple[str, str], int] = {}
         REPEATED_ERROR_BREAK_THRESHOLD = 3
+        # Identical-args SUCCESS guard: the error breaker above only sees
+        # ToolErrors. Production (2026-09-01) showed an agent re-issuing the
+        # exact same OCR call 97 times, every call succeeding, hoping for a
+        # different answer. Count identical-args successes too and break.
+        repeated_success_counts: dict[tuple[str, str], int] = {}
+        success_break_threshold = max(
+            2, int(self.settings.llm.repeated_success_break_threshold),
+        )
 
         try:
             for loop_idx in range(self.settings.llm.max_tool_loops_per_turn):
@@ -325,10 +333,11 @@ class Agent:
                     ret = await self._run_tools_parallel(
                         assistant.tool_calls, stream,
                         repeated_error_counts, REPEATED_ERROR_BREAK_THRESHOLD,
+                        repeated_success_counts, success_break_threshold,
                     )
                     if ret is not None:
                         # Circuit breaker tripped — return the fallback reply.
-                        return ret
+                        return self._close_with_fallback(ret)
                     # All tools completed; continue the outer loop so the LLM
                     # gets the tool results and can produce the final answer
                     # (or issue another batch of tool_calls).
@@ -337,13 +346,16 @@ class Agent:
                     ret = await self._run_one_tool_serial(
                         call, stream,
                         repeated_error_counts, REPEATED_ERROR_BREAK_THRESHOLD,
+                        repeated_success_counts, success_break_threshold,
                     )
                     if ret is not None:
                         # Circuit breaker tripped — return the fallback reply.
-                        return ret
+                        return self._close_with_fallback(ret)
 
             # safety fuse — too many loops without a final answer
-            return "(已达到工具循环上限,本轮未给出最终答复)"
+            return self._close_with_fallback(
+                "(已达到工具循环上限,本轮未给出最终答复)"
+            )
         except TransferRequested:
             raise
         except BaseException:
@@ -375,6 +387,8 @@ class Agent:
         stream: StreamHandle,
         repeated_error_counts: dict[tuple[str, str], int],
         threshold: int,
+        repeated_success_counts: dict[tuple[str, str], int],
+        success_threshold: int,
     ) -> str | None:
         """Run a single tool call serially, append its result to history.
 
@@ -384,6 +398,7 @@ class Agent:
         propagate to the dispatcher.
         """
         await stream.status(f"调用工具: {call.name}")
+        is_error = False
         try:
             result = await self._invoke_tool(call, stream)
             if call.name in {"notebook_write", "notebook_delete"}:
@@ -404,12 +419,14 @@ class Agent:
             ))
             raise                              # propagate to dispatcher
         except ToolError as err:
+            is_error = True
             result = f"[tool_error] {err}"
             if self._maybe_break_circuit(
                 call, result, repeated_error_counts, threshold,
             ):
                 return self._circuit_breaker_reply(call, result, threshold)
         except Exception as err:               # noqa: BLE001
+            is_error = True
             log.exception("tool %s raised", call.name)
             result = f"[tool_error] {type(err).__name__}: {err}"
         self.history.append(ChatMessage(
@@ -418,6 +435,12 @@ class Agent:
             tool_call_id=call.id,
             name=call.name,
         ))
+        if not is_error and self._maybe_break_on_repeated_success(
+            call, repeated_success_counts, success_threshold,
+        ):
+            return self._repeated_success_breaker_reply(
+                call, success_threshold,
+            )
         return None
 
     async def _run_tools_parallel(
@@ -426,6 +449,8 @@ class Agent:
         stream: StreamHandle,
         repeated_error_counts: dict[tuple[str, str], int],
         threshold: int,
+        repeated_success_counts: dict[tuple[str, str], int],
+        success_threshold: int,
     ) -> str | None:
         """Run a batch of parallel-safe tool calls concurrently.
 
@@ -470,6 +495,7 @@ class Agent:
                     fallback_reply = _TRANSFER_RAISE_SENTINEL
                 continue
             if isinstance(res, ToolError):
+                is_success = False
                 result = f"[tool_error] {res}"
                 if self._maybe_break_circuit(
                     call, result, repeated_error_counts, threshold,
@@ -483,14 +509,26 @@ class Agent:
             elif isinstance(res, BaseException):  # noqa: BLE001
                 log.exception("tool %s raised", call.name)
                 result = f"[tool_error] {type(res).__name__}: {res}"
+                is_success = False
             else:
                 result = res
+                is_success = True
             self.history.append(ChatMessage(
                 role="tool",
                 content=stringify_result(result),
                 tool_call_id=call.id,
                 name=call.name,
             ))
+            if (
+                is_success
+                and fallback_reply is None
+                and self._maybe_break_on_repeated_success(
+                    call, repeated_success_counts, success_threshold,
+                )
+            ):
+                fallback_reply = self._repeated_success_breaker_reply(
+                    call, success_threshold,
+                )
 
         if fallback_reply is _TRANSFER_RAISE_SENTINEL:
             raise next(
@@ -545,6 +583,63 @@ class Agent:
             ))
             return True
         return False
+
+    def _maybe_break_on_repeated_success(
+        self,
+        call: ToolCall,
+        repeated_success_counts: dict[tuple[str, str], int],
+        threshold: int,
+    ) -> bool:
+        """Track repeated identical SUCCESSFUL calls; True to break the loop.
+
+        The error breaker only sees ToolErrors. A model stuck on an
+        ambiguous field (e.g. a handwritten digit two OCR tools disagree on)
+        can instead re-issue the exact same call dozens of times, each call
+        succeeding, hoping for a different answer — 97 identical calls were
+        observed in one production turn. Re-asking the identical question
+        within a single turn adds no information; break and tell the model
+        to change its approach or ask the user.
+        """
+        args_sig = json.dumps(
+            call.arguments or {}, sort_keys=True, ensure_ascii=False,
+        )
+        key = (call.name, args_sig)
+        repeated_success_counts[key] = repeated_success_counts.get(key, 0) + 1
+        if repeated_success_counts[key] >= threshold:
+            log.warning(
+                "agent %s: tool %s succeeded %d times with identical args; "
+                "breaking tool loop to avoid pointless re-sampling",
+                self.role.name, call.name,
+                repeated_success_counts[key],
+            )
+            return True
+        return False
+
+    @staticmethod
+    def _repeated_success_breaker_reply(
+        call: ToolCall,
+        threshold: int,
+    ) -> str:
+        """User-facing fallback when the identical-success breaker trips."""
+        return (
+            f"操作已停止：工具「{call.name}」在本轮使用完全相同的参数被重复调用 "
+            f"{threshold} 次，重复同样的调用不会产生新信息。\n"
+            f"请换一种方式处理（例如更改提问方式、改用其他工具），"
+            f"或直接向用户提问确认。"
+        )
+
+    def _close_with_fallback(self, reply: str) -> str:
+        """Persist a fallback reply as a closing assistant message.
+
+        Cap-hit and circuit-breaker fallbacks used to end the turn with the
+        history still open on a tool round; the next user message then saw
+        unfinished work and could resume the exact same loop (production:
+        three consecutive cap-hit turns in one session). Appending the reply
+        closes the transcript and shows the next turn that the loop was
+        force-stopped.
+        """
+        self.history.append(ChatMessage(role="assistant", content=reply))
+        return reply
 
     async def _invoke_tool(self, call: ToolCall, stream: StreamHandle) -> Any:
         if not self.tools.has(call.name):

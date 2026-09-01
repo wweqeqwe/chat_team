@@ -208,16 +208,20 @@ async def test_gate_blocks_single_chat_blocked_user():
 
     assert h.calls == [], "blocked user must NOT reach the handler"
     frames = _drain(adapter)
-    # Expecting exactly one frame: the blocked_reply delivered as a finished
-    # stream frame (the only format WeCom honours for aibot_msg_callback
-    # replies — a plain text frame is silently dropped).
-    assert len(frames) == 1, frames
+    # Expecting exactly two frames: the finished stream close ("处理完成。")
+    # followed by the blocked_reply as a markdown message — the standard
+    # finish() shape WeCom honours for aibot_msg_callback replies.
+    assert len(frames) == 2, frames
     f = frames[0]
     assert f["cmd"] == "aibot_respond_msg"
     assert f["body"]["msgtype"] == "stream"
     assert f["body"]["stream"]["finish"] is True
-    assert f["body"]["stream"]["content"] == "您已被屏蔽"
     assert f["headers"]["req_id"] == "rq-m1"
+    md = frames[1]
+    assert md["cmd"] == "aibot_respond_msg"
+    assert md["body"]["msgtype"] == "markdown"
+    assert md["body"]["markdown"]["content"] == "您已被屏蔽"
+    assert md["headers"]["req_id"] == "rq-m1"
 
 
 async def test_blocked_reply_userid_placeholder_substituted():
@@ -239,13 +243,14 @@ async def test_blocked_reply_userid_placeholder_substituted():
     await adapter._handle_msg_callback(_single_msg_frame("m1", "alice"))
 
     frames = _drain(adapter)
-    assert len(frames) == 1
+    assert len(frames) == 2
     assert frames[0]["body"]["msgtype"] == "stream"
     assert frames[0]["body"]["stream"]["finish"] is True
+    assert frames[1]["body"]["msgtype"] == "markdown"
     # {userid} substituted with the sender's userid ("alice"); assert on
     # the substituted fragment rather than the full sentence so a wording
     # tweak in the test fixture can't break this assertion.
-    assert "alice" in frames[0]["body"]["stream"]["content"], frames[0]
+    assert "alice" in frames[1]["body"]["markdown"]["content"], frames[1]
 
 
 async def test_blocked_reply_unknown_placeholder_rendered_literally():
@@ -263,8 +268,9 @@ async def test_blocked_reply_unknown_placeholder_rendered_literally():
     await adapter._handle_msg_callback(_single_msg_frame("m1", "bob"))
 
     frames = _drain(adapter)
-    assert len(frames) == 1
-    content = frames[0]["body"]["stream"]["content"]
+    assert len(frames) == 2
+    assert frames[1]["body"]["msgtype"] == "markdown"
+    content = frames[1]["body"]["markdown"]["content"]
     assert "your id is bob" in content
     assert "hi {user}" in content          # unknown placeholder preserved literally
 

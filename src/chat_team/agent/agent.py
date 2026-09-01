@@ -289,6 +289,7 @@ class Agent:
                     tools=self.tools.specs_for(self._effective_tool_names()),
                     model=self._model(),
                     temperature=self._temperature(),
+                    max_tokens=self._max_tokens(),
                     reasoning_effort=self._reasoning_effort(),
                     image_detail=self._image_detail(),
                     image_base_dir=self.session.cwd,
@@ -659,6 +660,14 @@ class Agent:
 
     def _model(self) -> str:
         return self.role.llm.model or self.settings.llm.chat.model
+
+    def _max_tokens(self) -> int | None:
+        """Per-turn output cap from settings; 0/absent = provider default."""
+        try:
+            v = int(self.settings.llm.chat.max_tokens or 0)
+        except (TypeError, ValueError):
+            return None
+        return v if v > 0 else None
 
     def _temperature(self) -> float:
         if self.role.llm.temperature is None:

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import inspect
 import json
 import logging
 import os
@@ -25,6 +26,7 @@ from openai import (
 from ..adapters.base import blocks_to_text
 from . import debug_logger
 from . import http_debug_logger
+from .repetition import CHECK_STEP_CHARS, find_degenerate_repeat
 from .base import (
     ChatMessage,
     CompletionRequest,
@@ -44,12 +46,22 @@ class _EmptyCompletionError(RuntimeError):
     """The model completed without visible text or tool calls."""
 
 
+class _DegenerateOutputError(RuntimeError):
+    """Model output collapsed into verbatim repetition (generation loop).
+
+    Raised mid-stream (or after a non-stream completion) when the tail of
+    the output becomes many exact copies of one block.  Retryable: a fresh
+    sample almost always breaks the loop.
+    """
+
+
 _RETRYABLE_EXCEPTIONS: tuple[type[BaseException], ...] = (
     APITimeoutError,
     APIConnectionError,
     RateLimitError,
     InternalServerError,
     _EmptyCompletionError,
+    _DegenerateOutputError,
 )
 
 
@@ -362,6 +374,19 @@ class OpenAIChatCompletionProvider(LLMProvider):
             ))
         return out
 
+    @staticmethod
+    async def _quiet_close_stream(stream: Any) -> None:
+        """Best-effort close of an async stream after an early abort."""
+        close = getattr(stream, "aclose", None) or getattr(stream, "close", None)
+        if close is None:
+            return
+        try:
+            res = close()
+            if inspect.isawaitable(res):
+                await res
+        except Exception:                                          # noqa: BLE001
+            log.debug("closing aborted LLM stream failed", exc_info=True)
+
     async def _complete_with_streaming(
         self,
         kwargs: dict[str, Any],
@@ -398,6 +423,9 @@ class OpenAIChatCompletionProvider(LLMProvider):
             )
 
         content_parts: list[str] = []
+        content_acc = ""          # running text for degenerate-repeat detection
+        checked_content_len = 0   # last content length checked by the detector
+        args_checked: dict[int, int] = {}   # per-tool-call checked args length
         tool_calls_by_index: dict[int, dict[str, str]] = {}
         finish_reason = "stop"
         usage: dict[str, Any] | None = None
@@ -422,6 +450,16 @@ class OpenAIChatCompletionProvider(LLMProvider):
             part = getattr(delta, "content", None)
             if part:
                 content_parts.append(part)
+                content_acc += part
+                if len(content_acc) - checked_content_len >= CHECK_STEP_CHARS:
+                    checked_content_len = len(content_acc)
+                    pat = find_degenerate_repeat(content_acc)
+                    if pat is not None:
+                        await self._quiet_close_stream(maybe_stream)
+                        raise _DegenerateOutputError(
+                            "streaming content degenerated into repetition "
+                            f"(pattern {pat!r}); aborting stream to retry"
+                        )
                 if stream_text_callback is not None:
                     display = _strip_thinking_markup("".join(content_parts))
                     if display:
@@ -449,6 +487,17 @@ class OpenAIChatCompletionProvider(LLMProvider):
                     fn_args = getattr(fn, "arguments", None)
                     if fn_args:
                         state["arguments"] += fn_args
+                        acc = state["arguments"]
+                        if len(acc) - args_checked.get(idx, 0) >= CHECK_STEP_CHARS:
+                            args_checked[idx] = len(acc)
+                            pat = find_degenerate_repeat(acc)
+                            if pat is not None:
+                                await self._quiet_close_stream(maybe_stream)
+                                raise _DegenerateOutputError(
+                                    "tool-call arguments degenerated into "
+                                    f"repetition (pattern {pat!r}); aborting "
+                                    "stream to retry"
+                                )
 
         return (
             ChatMessage(
@@ -563,6 +612,21 @@ class OpenAIChatCompletionProvider(LLMProvider):
                                 content=_strip_thinking_markup(msg.content or ""),
                                 tool_calls=candidate_tool_calls,
                             )
+                            _pat = find_degenerate_repeat(
+                                _content_as_string(candidate_response_msg.content)
+                            )
+                            if _pat is None:
+                                for tc in (msg.tool_calls or []):
+                                    _pat = find_degenerate_repeat(
+                                        tc.function.arguments or ""
+                                    )
+                                    if _pat is not None:
+                                        break
+                            if _pat is not None:
+                                raise _DegenerateOutputError(
+                                    "completion degenerated into repetition "
+                                    f"(pattern {_pat!r}); retrying"
+                                )
                             candidate_finish_reason = choice.finish_reason or "stop"
                             candidate_usage = None
                             if getattr(candidate_completion, "usage", None) is not None:
@@ -670,6 +734,11 @@ class OpenAIChatCompletionProvider(LLMProvider):
                     usage = None
             raw_obj = completion
 
+        if (finish_reason or "") == "length":
+            log.warning(
+                "LLM response truncated at the output cap "
+                "(finish_reason=length); consider raising llm.chat.max_tokens"
+            )
         serialised_response = {
             "role": "assistant",
             "content": response_msg.content,

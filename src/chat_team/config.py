@@ -111,6 +111,12 @@ class LLMChatConfig:
     model: str = "gpt-4o-mini"
     temperature: float = 0.3
     history_token_budget: int = 12000
+    # Hard cap on output tokens per chat-turn call — the backstop against
+    # runaway/repetitive generation (together with the degenerate-repeat
+    # detector in llm/repetition.py). 0 = no cap (upstream model default).
+    # Note: applies to the whole response INCLUDING tool-call JSON, so keep
+    # it generous; cache-aware compaction inherits the agent's value.
+    max_tokens: int = 16384
     # Optional reasoning depth for chat turns. Keep empty to let provider/model
     # defaults decide.
     reasoning_effort: str = ""

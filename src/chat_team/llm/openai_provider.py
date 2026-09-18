@@ -540,6 +540,8 @@ class OpenAIChatCompletionProvider(LLMProvider):
             }
         if request.tools:
             kwargs["tools"] = _to_openai_tools(request.tools)
+        if request.tool_choice is not None:
+            kwargs["tool_choice"] = request.tool_choice
         if request.max_tokens:
             kwargs["max_tokens"] = request.max_tokens
         effort = (request.reasoning_effort or "").strip()

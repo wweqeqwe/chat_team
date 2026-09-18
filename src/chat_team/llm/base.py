@@ -44,6 +44,10 @@ class ToolSpec:
 class CompletionRequest:
     messages: list[ChatMessage]
     tools: list[ToolSpec] = field(default_factory=list)
+    # Optional per-request override.  Keep ``tools`` unchanged when a
+    # maintenance request must reuse the same cached request prefix; passing
+    # "none" tells compatible providers not to generate tool calls.
+    tool_choice: str | None = None
     model: str = ""
     temperature: float = 0.3
     max_tokens: int | None = None

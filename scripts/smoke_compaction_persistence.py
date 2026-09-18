@@ -94,7 +94,7 @@ class ScriptedLLM(LLMProvider):
         is_cache_aware_compactor = any(
             m.role == "system"
             and isinstance(m.content, str)
-            and "[系统维护任务：历史压缩]" in m.content
+            and "[系统维护任务：上下文检查点压缩]" in m.content
             for m in request.messages
         )
         if is_sterile_compactor or is_cache_aware_compactor:
@@ -164,7 +164,7 @@ async def test_compactor_prefix_summarised():
     # Head must be a system summary; second message must be a user message
     # (boundary always lands on user) so the LLM doesn't see an orphan tool.
     assert agent.history[0].role == "system"
-    assert "历史摘要" in agent.history[0].content
+    assert "历史交接摘要" in agent.history[0].content
     assert agent.history[1].role == "user"
     # The target-token policy keeps as many complete recent turns as fit.
     # With this deliberately tiny budget, only the latest complete turn fits.
@@ -269,7 +269,7 @@ async def test_compactor_six_turns_still_compacts():
     did = await maybe_compact(agent, llm)
     assert did, "compaction should run even when user turns == KEEP_LAST_USER_TURNS"
     assert agent.history[0].role == "system"
-    assert "历史摘要" in (agent.history[0].content or "")
+    assert "历史交接摘要" in (agent.history[0].content or "")
     assert agent.history[1].role == "user"
     # Tiny target → summary + latest complete user/assistant turn.
     assert len(agent.history) == 3, f"unexpected length {len(agent.history)}"
@@ -311,11 +311,12 @@ async def test_cache_aware_compactor_extends_last_agent_request():
     assert compact_request.call_kind == "compactor"
     assert compact_request.messages[:len(base_messages)] == base_messages
     assert compact_request.tools == base_tools
+    assert compact_request.tool_choice == "none"
     assert compact_request.model == base_request.model
     assert compact_request.temperature == base_request.temperature
     assert compact_request.reasoning_effort == base_request.reasoning_effort
     assert compact_request.messages[-1].role == "system"
-    assert "[系统维护任务：历史压缩]" in (
+    assert "[系统维护任务：上下文检查点压缩]" in (
         compact_request.messages[-1].content or ""
     )
     assert agent.history[0].role == "system"

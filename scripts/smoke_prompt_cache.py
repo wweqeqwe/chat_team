@@ -237,8 +237,9 @@ async def test_compactor_extends_last_request() -> None:
     assert compact.call_kind == "compactor"
     assert compact.messages[:len(base.messages)] == base.messages
     assert compact.tools == base.tools
+    assert compact.tool_choice == "none"
     assert compact.messages[-1].role == "system"
-    assert "系统维护任务：历史压缩" in (
+    assert "系统维护任务：上下文检查点压缩" in (
         compact.messages[-1].content or ""
     )
     print("  PASS")

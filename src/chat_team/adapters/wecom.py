@@ -985,6 +985,61 @@ class WeComBotAdapter(BotAdapter):
         finally:
             self._pending_acks.pop(req_id, None)
 
+    async def send_proactive_markdown(self, chat_id: str, content: str) -> None:
+        """Push one markdown message through this adapter's existing socket."""
+        safe_chat_id = str(chat_id or "").strip()
+        safe_content = _truncate_utf8(str(content or "").strip(), MARKDOWN_CONTENT_MAX_BYTES)
+        if not safe_chat_id or not safe_content:
+            raise RuntimeError("proactive chat_id and markdown content are required")
+        response = await self._send_and_await(
+            {
+                "cmd": "aibot_send_msg",
+                "headers": {"req_id": _new_req_id()},
+                "body": {
+                    "chatid": safe_chat_id,
+                    "msgtype": "markdown",
+                    "markdown": {"content": safe_content},
+                },
+            }
+        )
+        if int(response.get("errcode") or 0) != 0:
+            raise RuntimeError(
+                f"WeCom proactive markdown rejected: {response.get('errmsg') or response.get('errcode')}"
+            )
+
+    async def send_proactive_media(
+        self,
+        chat_id: str,
+        path: Path,
+        *,
+        kind: str,
+        filename: str | None = None,
+    ) -> None:
+        """Upload and push one image/file through the existing bot connection."""
+        if kind not in {"image", "file"}:
+            raise RuntimeError(f"unsupported proactive media kind: {kind}")
+        data = await asyncio.to_thread(path.read_bytes)
+        media_id = await self.upload_media(
+            data,
+            kind=kind,
+            filename=filename or path.name,
+        )
+        response = await self._send_and_await(
+            {
+                "cmd": "aibot_send_msg",
+                "headers": {"req_id": _new_req_id()},
+                "body": {
+                    "chatid": str(chat_id or "").strip(),
+                    "msgtype": kind,
+                    kind: {"media_id": media_id},
+                },
+            }
+        )
+        if int(response.get("errcode") or 0) != 0:
+            raise RuntimeError(
+                f"WeCom proactive {kind} rejected: {response.get('errmsg') or response.get('errcode')}"
+            )
+
     async def upload_media(self, data: bytes, *, kind: str, filename: str) -> str:
         """Upload bytes via aibot_upload_media_init/chunk/finish; return media_id."""
         if kind not in ("image", "file"):

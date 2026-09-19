@@ -389,6 +389,7 @@ async def _run_solo(
     persistence = PersistenceManager(settings)
 
     adapters: list[tuple[BotAdapter, Dispatcher]] = []
+    advisor_bridges: list = []
     for bot_cfg in settings.bots:
         if not roles.has(bot_cfg.name):
             raise RuntimeError(
@@ -413,6 +414,16 @@ async def _run_solo(
         )
         adapter.set_handler(dispatcher.handle)
         adapters.append((adapter, dispatcher))
+        if (
+            bot_cfg.name == "service_advisor"
+            and os.path.exists("/etc/gongchuang-advisor-bridge.enabled")
+        ):
+            from .advisor_bridge import AdvisorDirectBridge
+
+            bridge = AdvisorDirectBridge(adapter, dispatcher)
+            adapter.set_handler(bridge.handle_incoming)
+            advisor_bridges.append(bridge)
+            log.info("service_advisor direct bridge enabled")
         log.info("solo bot '%s' configured (bot_id=%s)", bot_cfg.name, bot_cfg.bot_id[:8] + "...")
 
     reloader = Reloader(
@@ -427,7 +438,10 @@ async def _run_solo(
     out_rotator.start()
     try:
         await _run_with_shutdown(
-            asyncio.gather(*[a.run_forever() for a, _ in adapters]),
+            asyncio.gather(
+                *[a.run_forever() for a, _ in adapters],
+                *[bridge.run_forever() for bridge in advisor_bridges],
+            ),
             on_sighup=reloader.reload,
         )
     finally:
